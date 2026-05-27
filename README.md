@@ -56,18 +56,66 @@ korgchat --journal ./my-conversation.json --mock
 
 ## Causal chain
 
-KorgChat writes 2 events per turn:
+KorgChat writes ≥2 events per turn (more when the model invokes tools):
 
 ```
-turn 1:  seq=1  user_prompt          triggered_by=None
-         seq=2  llm_inference        triggered_by=1
-turn 2:  seq=3  user_prompt          triggered_by=2   ← chains to prior LLM round
-         seq=4  llm_inference        triggered_by=3
+turn 1 (text only):
+  seq=1  user_prompt          triggered_by=None
+  seq=2  llm_inference        triggered_by=1
+
+turn 2 (with tool use):
+  seq=3  user_prompt          triggered_by=2     ← chains to prior turn's LLM
+  seq=4  llm_inference        triggered_by=3      (round 1: LLM asks for `add`)
+  seq=5  add tool_call        triggered_by=4      (sibling under round-1 LLM)
+  seq=6  llm_inference        triggered_by=4      (round 2: LLM answers,
+                                                   chains to round-1 per spec §2a,
+                                                   NOT to the tool call at seq=5)
 ```
 
-The `user_prompt → llm_inference` shape mirrors what korgex emits, so a
-single ledger can host both interactive chat and autonomous agent runs
-without losing causal coherence.
+The `user_prompt → llm_inference → tool_call*` shape mirrors what korgex
+emits, so a single ledger can host both interactive chat and autonomous
+agent runs without losing causal coherence.
+
+## Tools (v0.4.1)
+
+KorgChat ships three deterministic built-in tools:
+
+| Name       | Input            | Output                  |
+|------------|------------------|-------------------------|
+| `echo`     | `{input: str}`   | `{echoed: str}`         |
+| `add`      | `{a, b: number}` | `{sum: number}`         |
+| `get_time` | `{}`             | `{unix_seconds: float}` |
+
+In `--mock` mode you can trigger a tool deterministically with the marker
+syntax `[tool:NAME(arg=value, ...)]` in your prompt:
+
+```
+You: please [tool:add(a=2, b=3)] for me
+  🔧 [ok] add(a=2, b=3) → {"sum": 5}  (seq=3, 0ms)
+Korg: toolu_… → {"sum": 5}
+```
+
+Embedding KorgChat as a library? Pass your own `ToolRegistry`:
+
+```python
+from korgchat import ChatSession, MockResponder, Tool, ToolRegistry
+
+reg = ToolRegistry([
+    Tool(name="read_file", description="...",
+         input_schema={"type": "object", "properties": {"path": {"type": "string"}},
+                       "required": ["path"]},
+         handler=lambda args: {"content": open(args["path"]).read()}),
+])
+
+session = ChatSession(
+    journal_path=".korg/journal.json",
+    responder=MockResponder(),
+    tools=reg,
+)
+```
+
+The safety cap `MAX_TOOL_USE_ITERATIONS` (8) terminates any model that
+keeps requesting tools without ever returning text.
 
 ## License
 

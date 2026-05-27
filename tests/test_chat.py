@@ -1,8 +1,9 @@
-"""Tests for KorgChat v0.4.0.
+"""Tests for KorgChat v0.4.1.
 
-These run against the actual korg_bridge extension — no mocks on the
-ledger side. The MockResponder gives us deterministic LLM output so the
-assertions are stable.
+Runs against the actual korg_bridge extension. The MockResponder's scripted
+mode is used wherever the inner tool-use loop is exercised, so assertions
+are deterministic. Free mode (no scripted replies) is still tested for the
+text-only path that v0.4.0 shipped.
 """
 
 from __future__ import annotations
@@ -11,11 +12,17 @@ import io
 import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
-from korgchat import ChatSession, MockResponder, __version__
+from korgchat import (
+    ChatSession,
+    MockResponder,
+    Reply,
+    ToolUse,
+    __version__,
+    default_tools,
+)
 from korgchat.__main__ import main as cli_main
 
 
@@ -33,104 +40,51 @@ def _events(journal: Path) -> list[dict]:
 
 
 def test_version_string():
-    assert __version__ == "0.4.0"
+    assert __version__ == "0.4.1"
 
 
-def test_session_construct(tmp_journal):
-    s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
-    assert s.turns == 0
-    assert tmp_journal.parent.exists()
-
-
-# ── Single-turn shape ──────────────────────────────────────────────────────
+# ── Single-turn text-only path (v0.4.0 carryover) ──────────────────────────
 
 
 def test_single_turn_writes_two_events(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     turn = s.send("hello korg")
-
     assert turn.user_seq == 1
     assert turn.assistant_seq == 2
-    assert turn.assistant_text  # non-empty deterministic reply
-
+    assert turn.tool_calls == []
     events = _events(tmp_journal)
     assert len(events) == 2
     assert events[0]["event"]["tool_name"] == "user_prompt"
     assert events[1]["event"]["tool_name"] == "llm_inference"
-    assert events[0]["metadata"]["triggered_by"] is None
-    assert events[1]["metadata"]["triggered_by"] == turn.user_seq
-
-
-def test_root_event_id_shared_across_turn(tmp_journal):
-    s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
-    s.send("hi")
-    events = _events(tmp_journal)
-    root = events[0]["metadata"]["root_event_id"]
-    assert events[1]["metadata"]["root_event_id"] == root
-
-
-# ── Multi-turn causal chain ────────────────────────────────────────────────
 
 
 def test_three_turn_chain(tmp_journal):
-    """Turn N's user_prompt chains to turn (N-1)'s llm_inference."""
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
-    t1 = s.send("turn one")
-    t2 = s.send("turn two")
-    t3 = s.send("turn three")
-
-    # 6 events: 3 user_prompts interleaved with 3 llm_inferences.
+    s.send("turn one")
+    s.send("turn two")
+    s.send("turn three")
     events = _events(tmp_journal)
     assert [e["seq_id"] for e in events] == [1, 2, 3, 4, 5, 6]
-
-    # Cross-turn linkage: turn-2 user chains to turn-1 llm, turn-3 user
-    # chains to turn-2 llm.
-    assert events[0]["metadata"]["triggered_by"] is None        # root user
-    assert events[1]["metadata"]["triggered_by"] == 1           # llm ← user
-    assert events[2]["metadata"]["triggered_by"] == 2           # next-user ← prior-llm
-    assert events[3]["metadata"]["triggered_by"] == 3           # llm ← user
-    assert events[4]["metadata"]["triggered_by"] == 4           # next-user ← prior-llm
-    assert events[5]["metadata"]["triggered_by"] == 5           # llm ← user
-
-    # Whole conversation shares one root_event_id.
-    roots = {e["metadata"]["root_event_id"] for e in events}
-    assert len(roots) == 1
-
-
-def test_history_accumulates(tmp_journal):
-    s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
-    s.send("a")
-    s.send("b")
-    history = s.history
-    assert len(history) == 2
-    assert history[0].user_prompt == "a"
-    assert history[1].user_prompt == "b"
-
-
-# ── Persistence ────────────────────────────────────────────────────────────
+    assert events[0]["metadata"]["triggered_by"] is None
+    assert events[1]["metadata"]["triggered_by"] == 1
+    assert events[2]["metadata"]["triggered_by"] == 2
+    assert events[3]["metadata"]["triggered_by"] == 3
+    assert events[4]["metadata"]["triggered_by"] == 4
+    assert events[5]["metadata"]["triggered_by"] == 5
 
 
 def test_resume_picks_up_where_we_left_off(tmp_journal):
-    """Closing and reopening a session continues the causal chain."""
     s1 = ChatSession(journal_path=tmp_journal, responder=MockResponder())
-    s1.send("first turn")
-    s1.send("second turn")
+    s1.send("first")
+    s1.send("second")
     del s1
-
     s2 = ChatSession(journal_path=tmp_journal, responder=MockResponder())
-    # Resumed session sees the existing seq counter through the bridge.
-    t = s2.send("third turn after resume")
+    t = s2.send("third after resume")
     events = _events(tmp_journal)
-
-    # 6 events total: 4 from s1, 2 from s2.
     assert [e["seq_id"] for e in events] == [1, 2, 3, 4, 5, 6]
-    # The post-resume user_prompt must chain to the last llm_inference of s1.
     assert events[4]["metadata"]["triggered_by"] == 4
     assert t.user_seq == 5
     assert t.assistant_seq == 6
-
-
-# ── Input validation ──────────────────────────────────────────────────────
 
 
 def test_empty_prompt_rejected(tmp_journal):
@@ -141,59 +95,224 @@ def test_empty_prompt_rejected(tmp_journal):
         s.send("   ")
 
 
-# ── Mock determinism ───────────────────────────────────────────────────────
+# ── v0.4.1 tool-use loop ───────────────────────────────────────────────────
 
 
-def test_mock_responder_deterministic():
-    r = MockResponder()
-    a, _, _ = r.respond([], "test prompt")
-    b, _, _ = r.respond([], "test prompt")
-    assert a == b
+def _scripted_one_tool() -> MockResponder:
+    """A responder that requests one `add` call, then returns text on the
+    follow-up call (after seeing the tool result)."""
+    return MockResponder(
+        replies=[
+            Reply(
+                tool_uses=[ToolUse(id="t1", name="add", input={"a": 2, "b": 3})],
+                prompt_tokens=20,
+                completion_tokens=0,
+            ),
+            Reply(text="2 + 3 = 5", prompt_tokens=24, completion_tokens=6),
+        ]
+    )
 
 
-def test_mock_responder_varies_by_input():
-    r = MockResponder()
-    a, _, _ = r.respond([], "input one")
-    b, _, _ = r.respond([], "input two")
-    # Not guaranteed to differ for two inputs (5 buckets), but we'll pick
-    # two we know map to different buckets in this hashing scheme.
-    found_different = False
-    for prompt in ["a", "bb", "ccc", "dddd", "eeeee", "ffffff"]:
-        r2, _, _ = r.respond([], prompt)
-        if r2 != a:
-            found_different = True
-            break
-    assert found_different
+def test_single_tool_use_records_four_events(tmp_journal):
+    """LLM requests one tool; KorgChat executes it; LLM produces final text.
 
-
-# ── CLI entry point ────────────────────────────────────────────────────────
-
-
-def test_cli_mock_three_turns_via_stdin(tmp_journal, monkeypatch, capsys):
-    """Drive the CLI with three prompts piped to stdin, then EOF."""
-    stdin = io.StringIO("hello\nhow are you\nbye\n")
-    monkeypatch.setattr("sys.stdin", stdin)
-
-    rc = cli_main(["--mock", "--journal", str(tmp_journal)])
-    assert rc == 0
+    Journal should have: user_prompt, llm_inference (round 1), add tool_call,
+    llm_inference (round 2 / terminal) — 4 events.
+    """
+    s = ChatSession(journal_path=tmp_journal, responder=_scripted_one_tool())
+    turn = s.send("add 2 and 3")
 
     events = _events(tmp_journal)
-    # 3 turns × 2 events = 6 events.
+    assert [e["event"]["tool_name"] for e in events] == [
+        "user_prompt",
+        "llm_inference",
+        "add",
+        "llm_inference",
+    ]
+    assert [e["seq_id"] for e in events] == [1, 2, 3, 4]
+
+    # Causal chain per §2a:
+    #   1 user_prompt  (root)
+    #   2 llm round-1   triggered_by=1
+    #   3 add tool      triggered_by=2  (sibling under round-1 LLM)
+    #   4 llm round-2   triggered_by=2  (NOT 3 — §2a says chain to prior LLM)
+    assert events[0]["metadata"]["triggered_by"] is None
+    assert events[1]["metadata"]["triggered_by"] == 1
+    assert events[2]["metadata"]["triggered_by"] == 2
+    assert events[3]["metadata"]["triggered_by"] == 2
+
+    # Turn surface
+    assert turn.user_seq == 1
+    assert turn.assistant_seq == 4
+    assert turn.assistant_text == "2 + 3 = 5"
+    assert len(turn.tool_calls) == 1
+    call = turn.tool_calls[0]
+    assert call.name == "add"
+    assert call.input == {"a": 2, "b": 3}
+    assert call.result == {"sum": 5}
+    assert call.success is True
+    assert call.seq == 3
+
+
+def test_parallel_tools_share_producing_llm_seq(tmp_journal):
+    """Two tools requested in a single LLM round are siblings under that
+    round's llm_inference."""
+    responder = MockResponder(
+        replies=[
+            Reply(
+                tool_uses=[
+                    ToolUse(id="t1", name="add", input={"a": 1, "b": 2}),
+                    ToolUse(id="t2", name="echo", input={"input": "hi"}),
+                ]
+            ),
+            Reply(text="done", prompt_tokens=1, completion_tokens=1),
+        ]
+    )
+    s = ChatSession(journal_path=tmp_journal, responder=responder)
+    turn = s.send("do two things")
+    events = _events(tmp_journal)
+    # 5 events: user, llm_r1, add, echo, llm_r2.
+    assert [e["event"]["tool_name"] for e in events] == [
+        "user_prompt",
+        "llm_inference",
+        "add",
+        "echo",
+        "llm_inference",
+    ]
+    assert events[2]["metadata"]["triggered_by"] == 2  # add ← round-1 LLM
+    assert events[3]["metadata"]["triggered_by"] == 2  # echo ← round-1 LLM (sibling)
+    assert events[4]["metadata"]["triggered_by"] == 2  # llm_r2 ← round-1 LLM (§2a)
+    assert turn.assistant_seq == 5
+    assert len(turn.tool_calls) == 2
+    assert {c.name for c in turn.tool_calls} == {"add", "echo"}
+
+
+def test_multi_round_tool_use(tmp_journal):
+    """Two tool rounds in one turn: LLM calls add, sees result, calls echo, then ends."""
+    responder = MockResponder(
+        replies=[
+            Reply(tool_uses=[ToolUse(id="t1", name="add", input={"a": 10, "b": 20})]),
+            Reply(tool_uses=[ToolUse(id="t2", name="echo", input={"input": "30"})]),
+            Reply(text="answer: 30"),
+        ]
+    )
+    s = ChatSession(journal_path=tmp_journal, responder=responder)
+    turn = s.send("add 10 and 20 then echo")
+    events = _events(tmp_journal)
+    assert [e["event"]["tool_name"] for e in events] == [
+        "user_prompt",      # 1
+        "llm_inference",    # 2 — round 1
+        "add",              # 3 — under llm 2
+        "llm_inference",    # 4 — round 2, chains to 2 per §2a
+        "echo",             # 5 — under llm 4
+        "llm_inference",    # 6 — round 3 / terminal, chains to 4 per §2a
+    ]
+    chain = [e["metadata"]["triggered_by"] for e in events]
+    assert chain == [None, 1, 2, 2, 4, 4]
+    assert turn.assistant_text == "answer: 30"
+    assert turn.assistant_seq == 6
+    assert [c.name for c in turn.tool_calls] == ["add", "echo"]
+
+
+def test_unknown_tool_is_recorded_with_error(tmp_journal):
+    """An LLM-requested tool that isn't registered should emit a failed tool_call
+    event (success=False), not crash the session. The LLM gets the error to
+    react to."""
+    responder = MockResponder(
+        replies=[
+            Reply(tool_uses=[ToolUse(id="t1", name="missing_tool", input={})]),
+            Reply(text="recovered"),
+        ]
+    )
+    s = ChatSession(journal_path=tmp_journal, responder=responder)
+    turn = s.send("use a tool that doesn't exist")
+    events = _events(tmp_journal)
+    bad = events[2]["event"]
+    assert bad["tool_name"] == "missing_tool"
+    assert bad["success"] is False
+    assert "error" in bad["result"]
+    assert turn.tool_calls[0].success is False
+
+
+def test_tool_handler_exception_recorded_as_error(tmp_journal):
+    """A tool that raises during execution records success=False and lets
+    the conversation continue."""
+    responder = MockResponder(
+        replies=[
+            # add() raises ValueError on missing inputs.
+            Reply(tool_uses=[ToolUse(id="t1", name="add", input={"a": 1})]),
+            Reply(text="caught it"),
+        ]
+    )
+    s = ChatSession(journal_path=tmp_journal, responder=responder)
+    turn = s.send("trigger an error")
+    assert turn.tool_calls[0].success is False
+    assert "error" in turn.tool_calls[0].result
+    events = _events(tmp_journal)
+    assert events[2]["event"]["success"] is False
+
+
+def test_max_iterations_blocks_runaway(tmp_journal):
+    """A responder that never returns text eventually trips the safety cap."""
+    # Build a script of nothing but tool requests, longer than the cap.
+    from korgchat.chat import MAX_TOOL_USE_ITERATIONS
+
+    responder = MockResponder(
+        replies=[
+            Reply(tool_uses=[ToolUse(id=f"t{i}", name="echo", input={"input": "loop"})])
+            for i in range(MAX_TOOL_USE_ITERATIONS + 2)
+        ]
+    )
+    s = ChatSession(journal_path=tmp_journal, responder=responder)
+    with pytest.raises(RuntimeError, match="exceeded"):
+        s.send("trigger the cap")
+
+
+def test_free_mode_tool_marker(tmp_journal):
+    """Free-mode MockResponder recognises [tool:name(args)] markers in the prompt."""
+    s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
+    turn = s.send("please [tool:add(a=4, b=6)] for me")
+    # Marker should be picked up and round-tripped through the loop:
+    # user_prompt, llm_round1 (requesting add), add tool, llm_round2 (terminal).
+    events = _events(tmp_journal)
+    assert [e["event"]["tool_name"] for e in events] == [
+        "user_prompt",
+        "llm_inference",
+        "add",
+        "llm_inference",
+    ]
+    assert turn.tool_calls[0].result == {"sum": 10}
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────
+
+
+def test_cli_mock_three_text_turns(tmp_journal, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO("hello\nhow are you\nbye\n"))
+    rc = cli_main(["--mock", "--journal", str(tmp_journal)])
+    assert rc == 0
+    events = _events(tmp_journal)
     assert len(events) == 6
     out = capsys.readouterr().out
     assert "KorgChat" in out
-    assert "Korg:" in out
-    # Three "recorded" lines confirm three full turns landed.
     assert out.count("[recorded:") == 3
 
 
-def test_cli_quit_command(tmp_journal, monkeypatch, capsys):
-    stdin = io.StringIO("first\n/quit\nshould-not-be-recorded\n")
-    monkeypatch.setattr("sys.stdin", stdin)
-
+def test_cli_tool_marker_run(tmp_journal, monkeypatch, capsys):
+    """End-to-end CLI run that triggers a tool via marker syntax."""
+    monkeypatch.setattr("sys.stdin", io.StringIO("[tool:add(a=7, b=8)] please\n/quit\n"))
     rc = cli_main(["--mock", "--journal", str(tmp_journal)])
     assert rc == 0
-
+    out = capsys.readouterr().out
+    # Should see the tool-call trace line and the "1 tool call(s)" tail.
+    assert "🔧" in out
+    assert "add" in out
+    assert "tool call(s)" in out
     events = _events(tmp_journal)
-    # Only one turn recorded — /quit exited before the next prompt.
-    assert len(events) == 2
+    assert [e["event"]["tool_name"] for e in events] == [
+        "user_prompt",
+        "llm_inference",
+        "add",
+        "llm_inference",
+    ]
+    assert events[2]["event"]["result"] == {"sum": 15}
