@@ -105,6 +105,53 @@ The `user_prompt → llm_inference → tool_call*` shape mirrors what korgex
 emits, so a single ledger can host both interactive chat and autonomous
 agent runs without losing causal coherence.
 
+## Branches — try different threads side-by-side (v0.5.0)
+
+A conversation branch is a bookmark into the journal: a name + the seq
+you forked from + the head you've grown it to. Switching between
+branches resumes from the right point so you can explore alternatives
+without losing the original thread.
+
+```
+You: tell me about rust ownership
+Korg: ...
+You: /fork rust-deep-dive
+[fork] branch 'rust-deep-dive' created at seq=2, now active
+
+You: rust lifetimes are tricky
+Korg: ...
+You: /checkout main
+[checkout] now on 'main' (seq=6)
+
+You: back to a different topic
+Korg: ...
+You: /branches
+[branches] active = 'main'
+  main             (trunk)  ← current
+  rust-deep-dive   fork@2  tip@6  (2026-05-27 09:44:29)
+
+You: /checkout rust-deep-dive
+[checkout] now on 'rust-deep-dive' (seq=6)
+  (next turn will chain triggered_by from seq=6; in-memory history cleared)
+```
+
+| Command                          | Effect                                                        |
+|----------------------------------|---------------------------------------------------------------|
+| `/branches`                      | List named branches with a `← current` marker on the active one |
+| `/fork <name>`                   | Bookmark this point as a branch and switch to it              |
+| `/checkout <name|main>`          | Resume from the named branch's tip; clears in-memory history   |
+| `/branch-delete <name>`          | Drop a bookmark. The events themselves stay in the journal     |
+| `/branch-rename <old> <new>`     | Rename a bookmark                                              |
+
+How it works: branches are stored in `.korg/branches.json` next to the
+journal. The journal events themselves are unchanged — they're still
+chained via `triggered_by`. A branch is just a saved seq_id where the
+next turn should chain from. The natural DAG that results means main
+and a fork share ancestry up to the fork point, then diverge.
+
+Names must be 1–64 chars of `[A-Za-z0-9_-]`. `main` is reserved for the
+implicit trunk.
+
 ## Recall — search your conversations (v0.4.3)
 
 Every event KorgChat writes — user prompts, model replies, tool calls, tool

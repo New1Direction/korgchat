@@ -73,7 +73,10 @@ def _print_banner(session: ChatSession, mock: bool, streaming: bool) -> None:
     stream_tag = "" if streaming else "  (--no-stream)"
     print(f" responder:  {session.responder.model}{mode_tag}{stream_tag}")
     print(f" tools:      {', '.join(session.tools.names()) or '(none)'}")
-    print(f" exit:       /quit, /exit, or Ctrl-D")
+    branch_count = len(session.branches.list())
+    extra = f"  (+{branch_count} branch{'es' if branch_count != 1 else ''})" if branch_count else ""
+    print(f" branch:     {session.current_branch}{extra}")
+    print(f" exit:       /quit, /exit, or Ctrl-D  (try /help for commands)")
     print(border)
 
 
@@ -100,12 +103,17 @@ _SLASH_EXIT    = object()   # command asked the REPL to exit (code 0)
 def _cmd_help(_args: str, _session: ChatSession) -> object:
     print(
         "\nKorgChat slash commands:\n"
-        "  /help                 — this list\n"
-        "  /recall <query>       — search prior turns (substring, AND of terms)\n"
-        "  /recall --kind K Q    — filter by event kind: user_prompt | llm_inference | tool_call\n"
-        "  /recall --since 7d Q  — only events from the last N days (or 24h, 30m, ...)\n"
-        "  /recall --limit N Q   — cap matches (default 10)\n"
-        "  /quit, /exit          — leave the REPL\n"
+        "  /help                  — this list\n"
+        "  /recall <query>        — search prior turns (substring, AND of terms)\n"
+        "  /recall --kind K Q     — filter by event kind: user_prompt | llm_inference | tool_call\n"
+        "  /recall --since 7d Q   — only events from the last N days (24h, 30m, ...)\n"
+        "  /recall --limit N Q    — cap matches (default 10)\n"
+        "  /branches              — list named conversation branches (with current marker)\n"
+        "  /fork <name>           — bookmark this point as a branch and switch to it\n"
+        "  /checkout <name|main>  — switch the active branch; new turns resume from its tip\n"
+        "  /branch-delete <name>  — drop a branch bookmark (the events themselves stay in the journal)\n"
+        "  /branch-rename <old> <new> — rename a branch\n"
+        "  /quit, /exit           — leave the REPL\n"
     )
     return _SLASH_HANDLED
 
@@ -170,9 +178,114 @@ def _cmd_recall(args: str, session: ChatSession) -> object:
     return _SLASH_HANDLED
 
 
+def _cmd_branches(_args: str, session: ChatSession) -> object:
+    """List all branches with a `← current` marker on the active one."""
+    from korgchat.branches import MAIN_BRANCH
+    branches = session.branches.list()
+    cur = session.current_branch
+    main_marker = "  ← current" if cur == MAIN_BRANCH else ""
+    print(f"\n[branches] active = {cur!r}")
+    print(f"  {MAIN_BRANCH:<24} (trunk){main_marker}")
+    if not branches:
+        print(f"  (no named branches — use /fork <name> to create one)")
+    else:
+        for b in branches:
+            marker = "  ← current" if b.name == cur else ""
+            short_ts = b.created_at[:19].replace("T", " ")
+            print(
+                f"  {b.name:<24} fork@{b.fork_seq}  tip@{b.tip_seq}  "
+                f"({short_ts}){marker}"
+            )
+    return _SLASH_HANDLED
+
+
+def _cmd_fork(args: str, session: ChatSession) -> object:
+    """`/fork <name>` — create a branch bookmark here, switch to it."""
+    name = args.strip()
+    if not name:
+        print("[fork] usage: /fork <name>")
+        return _SLASH_HANDLED
+    try:
+        session.fork_here(name)
+    except (ValueError, KeyError) as e:
+        print(f"[fork] {e}")
+        return _SLASH_HANDLED
+    b = session.branches.get(name)
+    print(f"\n[fork] branch {name!r} created at seq={b.fork_seq}, now active")
+    return _SLASH_HANDLED
+
+
+def _cmd_checkout(args: str, session: ChatSession) -> object:
+    """`/checkout <name|main>` — switch active branch."""
+    from korgchat.branches import MAIN_BRANCH
+    name = args.strip()
+    if not name:
+        print("[checkout] usage: /checkout <name|main>")
+        return _SLASH_HANDLED
+    try:
+        tip = session.checkout(name)
+    except KeyError as e:
+        print(f"[checkout] {e}")
+        return _SLASH_HANDLED
+    tip_repr = "empty" if tip is None or tip == 0 else f"seq={tip}"
+    print(f"\n[checkout] now on {name!r} ({tip_repr})")
+    if name != MAIN_BRANCH:
+        print(
+            f"  (next turn will chain triggered_by from {tip_repr}; "
+            f"in-memory history cleared)"
+        )
+    return _SLASH_HANDLED
+
+
+def _cmd_branch_delete(args: str, session: ChatSession) -> object:
+    name = args.strip()
+    if not name:
+        print("[branch-delete] usage: /branch-delete <name>")
+        return _SLASH_HANDLED
+    if name == session.current_branch:
+        print(
+            f"[branch-delete] refusing to delete the active branch — "
+            f"`/checkout main` first."
+        )
+        return _SLASH_HANDLED
+    try:
+        b = session.branches.delete(name)
+    except (KeyError, ValueError) as e:
+        print(f"[branch-delete] {e}")
+        return _SLASH_HANDLED
+    print(
+        f"\n[branch-delete] removed {b.name!r} (events from seq={b.fork_seq} "
+        f"to {b.tip_seq} stay in the journal)"
+    )
+    return _SLASH_HANDLED
+
+
+def _cmd_branch_rename(args: str, session: ChatSession) -> object:
+    parts = args.split()
+    if len(parts) != 2:
+        print("[branch-rename] usage: /branch-rename <old> <new>")
+        return _SLASH_HANDLED
+    old, new = parts
+    try:
+        session.branches.rename(old, new)
+    except (KeyError, ValueError) as e:
+        print(f"[branch-rename] {e}")
+        return _SLASH_HANDLED
+    # Update session pointer if we renamed the current branch.
+    if session.current_branch == old:
+        session.current_branch = new
+    print(f"\n[branch-rename] {old!r} → {new!r}")
+    return _SLASH_HANDLED
+
+
 _SLASH_COMMANDS = {
     "/help": _cmd_help,
     "/recall": _cmd_recall,
+    "/branches": _cmd_branches,
+    "/fork": _cmd_fork,
+    "/checkout": _cmd_checkout,
+    "/branch-delete": _cmd_branch_delete,
+    "/branch-rename": _cmd_branch_rename,
 }
 
 

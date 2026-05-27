@@ -36,6 +36,7 @@ from typing import Any, Callable
 
 import korg_bridge
 
+from korgchat.branches import MAIN_BRANCH, BranchStore
 from korgchat.tools import ToolRegistry, default_tools
 
 
@@ -466,7 +467,7 @@ class ChatSession:
     journal_path: Path
     responder: Responder
     tools: ToolRegistry = field(default_factory=default_tools)
-    source_agent: str = "agent:korgchat@0.4.3"
+    source_agent: str = "agent:korgchat@0.5.0"
     on_tool_call: Callable[[ToolCall], None] | None = None
     # v0.4.2: streaming callbacks. When `on_token` is set, the session routes
     # each LLM round through Responder.stream() so the caller sees text chunks
@@ -475,6 +476,12 @@ class ChatSession:
     on_token: Callable[[str], None] | None = None
     on_round_start: Callable[[], None] | None = None
     _bridge: korg_bridge.Bridge = field(init=False)
+    _branches: BranchStore = field(init=False)
+    # v0.5.0: which named branch is currently active. "main" = the implicit
+    # trunk (its tip is the journal's latest seq); anything else is a
+    # bookmark in `.korg/branches.json`. New turns chain triggered_by from
+    # whichever branch's tip is current.
+    current_branch: str = MAIN_BRANCH
     _history: list[Turn] = field(default_factory=list, init=False)
     _last_llm_seq: int | None = field(default=None, init=False)
     # Stateful Anthropic message buffer for mid-turn continuations.
@@ -485,7 +492,10 @@ class ChatSession:
         self.journal_path = Path(self.journal_path)
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         self._bridge = korg_bridge.Bridge(str(self.journal_path))
-        self._last_llm_seq = self._bridge.last_seq_id() or None
+        # Branches sidecar lives next to the journal so the two travel
+        # together as a single conversation artifact.
+        self._branches = BranchStore(self.journal_path.parent / "branches.json")
+        self._last_llm_seq = self._resolve_branch_tip(self.current_branch)
 
     @property
     def history(self) -> list[Turn]:
@@ -494,6 +504,47 @@ class ChatSession:
     @property
     def turns(self) -> int:
         return len(self._history)
+
+    # ── Branch management (v0.5.0) ─────────────────────────────────────
+
+    @property
+    def branches(self) -> BranchStore:
+        return self._branches
+
+    def _resolve_branch_tip(self, name: str) -> int | None:
+        """Return the seq_id new turns should chain triggered_by from when
+        operating on this branch. Main = journal's latest overall seq."""
+        if name == MAIN_BRANCH:
+            return self._bridge.last_seq_id() or None
+        return self._branches.get(name).tip_seq
+
+    def fork_here(self, name: str) -> None:
+        """Create a new branch bookmark at the current `_last_llm_seq` and
+        switch to it. Empty-journal fork is rejected (nothing to fork from)."""
+        fork_seq = self._last_llm_seq
+        if fork_seq is None or fork_seq == 0:
+            raise ValueError(
+                "cannot fork: no events on this conversation yet. Send at "
+                "least one message before forking."
+            )
+        self._branches.create(name, fork_seq=fork_seq)
+        self.current_branch = name
+        # Clear in-memory history when switching branches — a fresh REPL
+        # context per branch keeps prompts focused and avoids leaking the
+        # other branch's tail into prompts.
+        self._history = []
+        self._anthropic_buf = []
+
+    def checkout(self, name: str) -> int | None:
+        """Switch the active branch. New turns chain from the named branch's
+        tip (or the journal's latest overall seq for `main`)."""
+        if name != MAIN_BRANCH and name not in self._branches:
+            raise KeyError(f"branch {name!r} does not exist")
+        self.current_branch = name
+        self._last_llm_seq = self._resolve_branch_tip(name)
+        self._history = []
+        self._anthropic_buf = []
+        return self._last_llm_seq
 
     def send(self, prompt: str) -> Turn:
         """Send a prompt; loop through any tool-use rounds; return the Turn."""
@@ -569,6 +620,11 @@ class ChatSession:
                 )
                 self._history.append(turn)
                 self._last_llm_seq = llm_seq
+                # v0.5.0: when on a non-main branch, advance the branch's
+                # tip so the next checkout resumes from the right place.
+                # No-op for main (tip = journal latest, which already moved).
+                if self.current_branch != MAIN_BRANCH:
+                    self._branches.update_tip(self.current_branch, llm_seq)
                 return turn
 
             # Tools requested. Push the assistant tool_use blocks onto the
