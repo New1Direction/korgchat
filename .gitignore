@@ -14,3 +14,6 @@ venv/
 # Ledger output from local runs
 .korg/
 *.lock
+
+# Reports / one-off HTML artifacts (regenerated, not tracked)
+*.html
