@@ -13,6 +13,7 @@ from pathlib import Path
 from korgchat import __version__
 from korgchat.chat import ChatSession, MockResponder, ToolCall, select_responder
 from korgchat.recall import RecallEngine, format_matches
+from korgchat.summary import SummarizeEngine
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -103,17 +104,22 @@ _SLASH_EXIT    = object()   # command asked the REPL to exit (code 0)
 def _cmd_help(_args: str, _session: ChatSession) -> object:
     print(
         "\nKorgChat slash commands:\n"
-        "  /help                  — this list\n"
-        "  /recall <query>        — search prior turns (substring, AND of terms)\n"
-        "  /recall --kind K Q     — filter by event kind: user_prompt | llm_inference | tool_call\n"
-        "  /recall --since 7d Q   — only events from the last N days (24h, 30m, ...)\n"
-        "  /recall --limit N Q    — cap matches (default 10)\n"
-        "  /branches              — list named conversation branches (with current marker)\n"
-        "  /fork <name>           — bookmark this point as a branch and switch to it\n"
-        "  /checkout <name|main>  — switch the active branch; new turns resume from its tip\n"
-        "  /branch-delete <name>  — drop a branch bookmark (the events themselves stay in the journal)\n"
+        "  /help                   — this list\n"
+        "  /recall <query>         — search prior turns (substring, AND of terms)\n"
+        "  /recall --kind K Q      — filter by event kind: user_prompt | llm_inference | tool_call\n"
+        "  /recall --since 7d Q    — only events from the last N days (24h, 30m, ...)\n"
+        "  /recall --limit N Q     — cap matches (default 10)\n"
+        "  /summarize              — digest the current branch via the LLM\n"
+        "  /summarize <branch>     — digest a named branch (or 'main')\n"
+        "  /summarize --since DUR  — digest events from the last N (7d, 24h, ...)\n"
+        "  /summarize --topic Q    — digest events matching a /recall query\n"
+        "  /summarize --save       — also record the digest as a 'summary' event (findable via /recall)\n"
+        "  /branches               — list named conversation branches (with current marker)\n"
+        "  /fork <name>            — bookmark this point as a branch and switch to it\n"
+        "  /checkout <name|main>   — switch the active branch; new turns resume from its tip\n"
+        "  /branch-delete <name>   — drop a branch bookmark (the events themselves stay in the journal)\n"
         "  /branch-rename <old> <new> — rename a branch\n"
-        "  /quit, /exit           — leave the REPL\n"
+        "  /quit, /exit            — leave the REPL\n"
     )
     return _SLASH_HANDLED
 
@@ -278,9 +284,81 @@ def _cmd_branch_rename(args: str, session: ChatSession) -> object:
     return _SLASH_HANDLED
 
 
+def _cmd_summarize(args: str, session: ChatSession) -> object:
+    """/summarize [branch] [--since DUR] [--topic Q] [--limit N] [--save]"""
+    from korgchat.summary import DEFAULT_LIMIT
+
+    tokens = args.split()
+    since = None
+    topic = None
+    limit = DEFAULT_LIMIT
+    save = False
+    positional: list[str] = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "--since" and i + 1 < len(tokens):
+            d = _parse_duration(tokens[i + 1])
+            if d is None:
+                print(f"[summarize] bad --since {tokens[i + 1]!r}; try 7d, 24h, 30m")
+                return _SLASH_HANDLED
+            since = d
+            i += 2
+        elif t == "--topic" and i + 1 < len(tokens):
+            topic = tokens[i + 1]
+            i += 2
+        elif t == "--limit" and i + 1 < len(tokens):
+            try:
+                limit = max(1, int(tokens[i + 1]))
+            except ValueError:
+                print(f"[summarize] bad --limit {tokens[i + 1]!r}; expected int")
+                return _SLASH_HANDLED
+            i += 2
+        elif t == "--save":
+            save = True
+            i += 1
+        else:
+            positional.append(t)
+            i += 1
+
+    # Mutually-exclusive scope selectors (positional branch wins if multiple).
+    selectors = sum(1 for x in (positional, since, topic) if x)
+    if selectors > 1:
+        print(
+            "[summarize] choose exactly one scope: a branch name, "
+            "--since DUR, or --topic QUERY"
+        )
+        return _SLASH_HANDLED
+
+    engine = SummarizeEngine(session)
+    try:
+        if positional:
+            summary = engine.summarize_branch(positional[0], limit=limit, save=save)
+        elif since is not None:
+            summary = engine.summarize_since(since, limit=limit, save=save)
+        elif topic is not None:
+            summary = engine.summarize_topic(topic, limit=limit, save=save)
+        else:
+            # Default = current branch.
+            summary = engine.summarize_branch(limit=limit, save=save)
+    except Exception as e:  # noqa: BLE001 — surface anything from the responder
+        print(f"[summarize] error: {e}")
+        return _SLASH_HANDLED
+
+    print(f"\n[summarize] {summary.scope_descriptor}")
+    if summary.truncated:
+        print(f"  (showing the most recent {summary.event_count} events; older omitted)")
+    if summary.seq_id is not None:
+        print(f"  (saved as seq={summary.seq_id}; findable via /recall)")
+    print()
+    print(summary.text)
+    return _SLASH_HANDLED
+
+
 _SLASH_COMMANDS = {
     "/help": _cmd_help,
     "/recall": _cmd_recall,
+    "/summarize": _cmd_summarize,
     "/branches": _cmd_branches,
     "/fork": _cmd_fork,
     "/checkout": _cmd_checkout,

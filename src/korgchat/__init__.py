@@ -14,9 +14,10 @@ from korgchat.chat import (
 )
 from korgchat.branches import MAIN_BRANCH, Branch, BranchStore
 from korgchat.recall import Match, RecallEngine, format_matches
+from korgchat.summary import Summary, SummarizeEngine
 from korgchat.tools import Tool, ToolRegistry, default_tools
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "__version__",
@@ -45,4 +46,7 @@ __all__ = [
     "Branch",
     "BranchStore",
     "MAIN_BRANCH",
+    # summary (v0.5.1)
+    "Summary",
+    "SummarizeEngine",
 ]

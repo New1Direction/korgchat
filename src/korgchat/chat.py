@@ -245,6 +245,20 @@ class MockResponder(Responder):
                 completion_tokens=len(re.findall(r"\S+", text)),
             )
 
+        # v0.5.1: special-case /summarize prompts so the mock CLI experience
+        # produces something that *looks* like a digest instead of a haiku.
+        # Real (Anthropic) responders see the same marker as harmless
+        # preamble and produce a real summary.
+        from korgchat.summary import SUMMARY_PROMPT_MARKER
+
+        if SUMMARY_PROMPT_MARKER in prompt:
+            text = self._mock_summary(prompt)
+            return Reply(
+                text=text,
+                prompt_tokens=len(re.findall(r"\S+", prompt)),
+                completion_tokens=len(re.findall(r"\S+", text)),
+            )
+
         # Look for tool markers in the prompt: "[tool:add(a=2, b=3)]"
         tool_uses = []
         for m in self._TOOL_MARKER_RE.finditer(prompt):
@@ -307,6 +321,40 @@ class MockResponder(Responder):
                     except ValueError:
                         out[k] = v
         return out
+
+    @staticmethod
+    def _mock_summary(prompt: str) -> str:
+        """Produce a deterministic, structurally-honest "summary" for mock
+        mode. We extract counts of event types from the prompt body so the
+        digest reflects the actual scope, not a canned haiku."""
+        body = prompt.split("=== EVENTS ===", 1)[1] if "=== EVENTS ===" in prompt else ""
+        body = body.split("=== END EVENTS ===", 1)[0]
+
+        users = body.count("] user:")
+        assistants = body.count("] assistant:")
+        # Tool lines look like `] tool foo(...) → [ok] ...`
+        tools = body.count("] tool ")
+
+        # Pull the scope label from the prompt for a more useful first line.
+        scope = "the selected events"
+        for line in prompt.splitlines():
+            if line.startswith("Scope:"):
+                scope = line[len("Scope:"):].strip().rstrip(".")
+                break
+
+        parts = [
+            f"Summary of {scope}.",
+            f"Saw {users} user prompt(s), {assistants} assistant reply(ies), "
+            f"and {tools} tool invocation(s).",
+        ]
+        if users == 0 and assistants == 0 and tools == 0:
+            parts.append("Nothing substantive happened in this scope.")
+        else:
+            parts.append(
+                "Conversation flowed without notable interruptions or errors; "
+                "no open threads detected by the mock summarizer."
+            )
+        return " ".join(parts)
 
     @staticmethod
     def _summarize_tool_results(results: list[ToolResult]) -> str:

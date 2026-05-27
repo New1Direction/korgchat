@@ -105,6 +105,41 @@ The `user_prompt → llm_inference → tool_call*` shape mirrors what korgex
 emits, so a single ledger can host both interactive chat and autonomous
 agent runs without losing causal coherence.
 
+## Summarize — ask the LLM to digest prior conversation (v0.5.1)
+
+`/summarize` feeds a scoped slice of the journal back to the model and
+prints a digest. The first feature where the ledger, search, and the
+LLM work together.
+
+```
+You: tell me about rust ownership
+Korg: ...
+You: [tool:add(a=12, b=30)] please
+  🔧 [ok] add(a=12, b=30) → {"sum": 42}
+Korg: ...
+You: /summarize
+[summarize] branch 'main' (4 events)
+
+Summary of branch 'main' (4 events). Saw 1 user prompt(s), 2 assistant
+reply(ies), and 1 tool invocation(s). Conversation flowed without
+notable interruptions or errors; no open threads detected.
+```
+
+| Form                              | Scope                                                |
+|-----------------------------------|------------------------------------------------------|
+| `/summarize`                      | The current branch (default)                         |
+| `/summarize <branch>`             | A named branch or `main`                             |
+| `/summarize --since DUR`          | Events from the last N (`7d`, `24h`, `30m`, …)       |
+| `/summarize --topic Q`            | Events matching a /recall-style query                |
+| `/summarize --limit N`            | Cap the events sent to the model (default 50)        |
+| `/summarize --save`               | Also record the digest as a `summary` event in the journal so it's findable via `/recall` later |
+
+The summary call is ephemeral by default — no event is written to the
+journal unless you pass `--save`. With `AnthropicResponder` you get a
+real prose digest; with `MockResponder` you get a structurally-honest
+template (counts of user/assistant/tool events + scope label) so the
+CLI experience stays useful offline.
+
 ## Branches — try different threads side-by-side (v0.5.0)
 
 A conversation branch is a bookmark into the journal: a name + the seq
