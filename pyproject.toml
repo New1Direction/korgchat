@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "korgchat"
-version         = "0.5.1"
+version         = "0.5.2"
 description     = "KorgChat — the first chat product built on the Korg cognitive ledger. Every turn recorded via korg-bridge."
 readme          = "README.md"
 license         = { text = "MIT" }
@@ -31,6 +31,11 @@ dependencies = [
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40.0,<1.0.0"]
+# Semantic /recall (v0.5.2). fastembed is the smallest viable embedding
+# stack: ONNX Runtime, no torch dep. First run downloads the model
+# (~130MB) to ~/.cache/fastembed. Without this extra installed, the
+# RecallEngine silently falls back to substring matching.
+semantic  = ["fastembed>=0.4,<2.0"]
 dev       = ["pytest>=8.0.0,<9.0.0"]
 
 [project.scripts]

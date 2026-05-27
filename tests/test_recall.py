@@ -39,14 +39,14 @@ def _build_session(journal: Path, scripted: list[Reply]) -> ChatSession:
 
 
 def test_missing_journal_returns_empty(tmp_path):
-    eng = RecallEngine(tmp_path / "never.json")
+    eng = RecallEngine(tmp_path / "never.json", mode='substring')
     assert eng.search("anything") == []
 
 
 def test_empty_query_returns_empty(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     s.send("hello")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     assert eng.search("") == []
     assert eng.search("   ") == []
 
@@ -54,7 +54,7 @@ def test_empty_query_returns_empty(tmp_journal):
 def test_no_match_returns_empty(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     s.send("hello korg")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     assert eng.search("absolutely_not_present") == []
 
 
@@ -65,7 +65,7 @@ def test_finds_user_prompt(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     s.send("tell me about rust ownership")
     s.send("now tell me about python decorators")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     hits = eng.search("rust")
     assert len(hits) == 1
     assert hits[0].kind == "user_prompt"
@@ -81,7 +81,7 @@ def test_finds_assistant_text(tmp_journal):
         ],
     )
     s.send("what is it?")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     hits = eng.search("foo")
     assert len(hits) == 1
     assert hits[0].kind == "llm_inference"
@@ -98,7 +98,7 @@ def test_finds_tool_call_by_name(tmp_journal):
         ],
     )
     s.send("compute")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     hits = eng.search("add")
     assert any(h.kind == "add" for h in hits)
 
@@ -108,7 +108,7 @@ def test_and_semantics_requires_all_terms(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     s.send("rust borrow checker")
     s.send("python decorators")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     # Both terms in the first prompt → match
     assert len(eng.search("rust borrow")) == 1
     # "rust" yes, "decorators" only in the OTHER prompt → no event has both
@@ -118,7 +118,7 @@ def test_and_semantics_requires_all_terms(tmp_journal):
 def test_case_insensitive(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     s.send("Ledgers Are Cool")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     assert len(eng.search("ledgers")) == 1
     assert len(eng.search("LEDGERS")) == 1
     assert len(eng.search("LeDgErS")) == 1
@@ -133,7 +133,7 @@ def test_kind_filter_user_prompt_only(tmp_journal):
         scripted=[Reply(text="ledger holds the rust history", prompt_tokens=4, completion_tokens=5)],
     )
     s.send("ask about rust history")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     # Both events contain "rust" — kind filter picks one.
     user_only = eng.search("rust", kind="user_prompt")
     llm_only = eng.search("rust", kind="llm_inference")
@@ -156,7 +156,7 @@ def test_kind_filter_tool_call_excludes_chat_events(tmp_journal):
     # is what excludes it, not the search term missing.
     s.send("please run add then echo")
 
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     # Without filter, query "add" hits the user_prompt + the add tool_call.
     no_filter_add = eng.search("add")
     assert any(h.kind == "user_prompt" for h in no_filter_add)
@@ -186,7 +186,7 @@ def test_since_filter_excludes_old_events(tmp_journal):
     raw[0]["event"]["timestamp"] = ancient
     tmp_journal.write_text(json.dumps(raw, indent=2))
 
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     recent_only = eng.search("rust", since=timedelta(days=30))
     # Both prompts say "rust" but the first is now 400d old → excluded.
     assert len(recent_only) == 1
@@ -197,7 +197,7 @@ def test_limit_caps_results(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     for i in range(5):
         s.send(f"turn {i} mentions ledger")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     all_hits = eng.search("ledger")
     assert len(all_hits) == 5
     capped = eng.search("ledger", limit=2)
@@ -212,7 +212,7 @@ def test_more_hits_outranks_fewer(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     s.send("rust")
     s.send("rust rust rust borrow")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     hits = eng.search("rust")
     # Top-ranked should be the densely-rusty one.
     assert hits[0].snippet.count("rust") >= 2
@@ -223,7 +223,7 @@ def test_recency_tiebreak(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     s.send("first ledger entry")
     s.send("second ledger entry")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     hits = eng.search("ledger")
     assert hits[0].seq_id > hits[1].seq_id
 
@@ -238,7 +238,7 @@ def test_format_matches_no_results():
 def test_format_matches_renders_each_hit(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     s.send("rust borrow checker explainer")
-    eng = RecallEngine(tmp_journal)
+    eng = RecallEngine(tmp_journal, mode='substring')
     out = format_matches(eng.search("rust"), query="rust")
     assert "seq=" in out
     assert "user_prompt" in out
@@ -259,7 +259,7 @@ def test_cli_recall_finds_prior_turn(tmp_journal, monkeypatch, capsys):
     rc = cli_main(["--mock", "--journal", str(tmp_journal), "--stream-delay", "0"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "[recall]" in out
+    assert "[recall" in out  # matches both "[recall]" and "[recall · <mode>]"
     assert "match" in out
     assert "rust is fun" in out
 
@@ -267,7 +267,11 @@ def test_cli_recall_finds_prior_turn(tmp_journal, monkeypatch, capsys):
 def test_cli_recall_no_match_reports_cleanly(tmp_journal, monkeypatch, capsys):
     stdin = io.StringIO(
         "hello there\n"
-        "/recall absolutely_not_in_the_chat\n"
+        # Force substring mode — semantic recall may find a weak cosine
+        # hit on any English query, which is correct behaviour but
+        # incompatible with a "no matches" assertion. The semantic path
+        # is tested separately in test_semantic_recall.py.
+        "/recall --mode substring absolutely_not_in_the_chat\n"
         "/quit\n"
     )
     monkeypatch.setattr("sys.stdin", stdin)
@@ -308,4 +312,4 @@ def test_cli_recall_kind_filter_runs(tmp_journal, monkeypatch, capsys):
     rc = cli_main(["--mock", "--journal", str(tmp_journal), "--stream-delay", "0"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "[recall]" in out
+    assert "[recall" in out  # matches both "[recall]" and "[recall · <mode>]"

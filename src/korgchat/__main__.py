@@ -105,7 +105,8 @@ def _cmd_help(_args: str, _session: ChatSession) -> object:
     print(
         "\nKorgChat slash commands:\n"
         "  /help                   — this list\n"
-        "  /recall <query>         — search prior turns (substring, AND of terms)\n"
+        "  /recall <query>         — search prior turns (semantic if fastembed installed, else substring)\n"
+        "  /recall --mode M Q      — pick the search path: auto (default) | semantic | substring\n"
         "  /recall --kind K Q      — filter by event kind: user_prompt | llm_inference | tool_call\n"
         "  /recall --since 7d Q    — only events from the last N days (24h, 30m, ...)\n"
         "  /recall --limit N Q     — cap matches (default 10)\n"
@@ -143,10 +144,11 @@ def _parse_duration(s: str) -> timedelta | None:
 
 
 def _cmd_recall(args: str, session: ChatSession) -> object:
-    """Parse `/recall [--kind K] [--since DUR] [--limit N] <query>` and run."""
+    """Parse `/recall [--kind K] [--since DUR] [--limit N] [--mode M] <query>`."""
     kind: str | None = None
     since: timedelta | None = None
     limit = 10
+    mode = os.environ.get("KORGCHAT_RECALL_MODE", "auto")
     tokens = args.split()
     positional: list[str] = []
     i = 0
@@ -169,18 +171,34 @@ def _cmd_recall(args: str, session: ChatSession) -> object:
                 print(f"[recall] bad --limit: {tokens[i + 1]!r}; expected an integer")
                 return _SLASH_HANDLED
             i += 2
+        elif t == "--mode" and i + 1 < len(tokens):
+            mode = tokens[i + 1]
+            if mode not in {"auto", "semantic", "substring"}:
+                print(
+                    f"[recall] bad --mode {mode!r}; expected one of: auto, semantic, substring"
+                )
+                return _SLASH_HANDLED
+            i += 2
         else:
             positional.append(t)
             i += 1
 
     query = " ".join(positional).strip()
     if not query:
-        print("[recall] usage: /recall [--kind K] [--since DUR] [--limit N] <query>")
+        print(
+            "[recall] usage: /recall [--mode M] [--kind K] [--since DUR] [--limit N] <query>"
+        )
         return _SLASH_HANDLED
 
-    engine = RecallEngine(session.journal_path)
+    engine = RecallEngine(session.journal_path, mode=mode)  # type: ignore[arg-type]
     matches = engine.search(query, kind=kind, since=since, limit=limit)
-    print("\n" + format_matches(matches, query=query))
+    # Render which path actually ran so the user (and tests) can tell.
+    header = format_matches(matches, query=query)
+    if matches:
+        header = header.replace(
+            "[recall] ", f"[recall · {engine.last_mode}] ", 1
+        )
+    print("\n" + header)
     return _SLASH_HANDLED
 
 

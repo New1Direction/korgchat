@@ -105,6 +105,48 @@ The `user_prompt → llm_inference → tool_call*` shape mirrors what korgex
 emits, so a single ledger can host both interactive chat and autonomous
 agent runs without losing causal coherence.
 
+## Semantic recall — search by meaning, not just words (v0.5.2)
+
+`/recall` now defaults to semantic mode when the optional `fastembed`
+extra is installed. Queries match by concept: "confused about borrowing"
+finds turns that *discuss* the rust borrow checker even if the literal
+word "borrowing" doesn't appear.
+
+```
+You: /recall --mode substring borrowing
+[recall] no matches for 'borrowing'
+
+You: /recall --mode semantic borrowing
+[recall · semantic] 8 match(es) for 'borrowing':
+  seq=1  user_prompt     how does the borrow checker prevent data races
+  seq=5  user_prompt     rust ownership and lifetimes
+  ...
+```
+
+Setup (optional — without it, `/recall` falls back to v0.4.3 substring):
+
+```bash
+pip install korgchat[semantic]
+```
+
+First search downloads the embedding model (~130MB, cached under
+`~/.cache/fastembed`). Subsequent embeds are sub-millisecond.
+
+Modes:
+
+| `--mode`     | Behavior                                                                  |
+|--------------|---------------------------------------------------------------------------|
+| `auto` (default) | Use semantic if `fastembed` is installed; otherwise fall back to substring. |
+| `semantic`   | Embedding-backed cosine ranking. Raises if `fastembed` is missing.        |
+| `substring`  | The v0.4.3 keyword path. AND-of-terms, case-insensitive.                  |
+
+Output header shows which path ran: `[recall · semantic]` vs `[recall · substring]`.
+
+Embeddings live in `.korg/embeddings.json` next to the journal. Only
+new events get embedded on each `/recall` call (incremental). Changing
+the model name invalidates the cache automatically — vectors from
+different models aren't comparable by cosine.
+
 ## Summarize — ask the LLM to digest prior conversation (v0.5.1)
 
 `/summarize` feeds a scoped slice of the journal back to the model and

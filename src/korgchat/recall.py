@@ -31,10 +31,26 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
+
+from korgchat.embeddings import (
+    DEFAULT_EMBEDDING_MODEL,
+    EmbeddingCache,
+    EmbeddingDependencyMissing,
+    EmbeddingEngine,
+    batch_cosine,
+    text_for_event,
+)
 
 
 SNIPPET_CONTEXT_CHARS = 60
+
+# Cosine threshold below which a "semantic" hit is dropped from results.
+# 0.30 is loose-but-not-noisy with BAAI/bge-small-en-v1.5 — empirical;
+# tighten in v0.5.3 if false-positive rate becomes an issue.
+SEMANTIC_MIN_SCORE = 0.30
+
+RecallMode = Literal["auto", "semantic", "substring"]
 
 
 @dataclass
@@ -53,12 +69,27 @@ class RecallEngine:
     """Search over the events on disk in `journal_path`.
 
     A fresh engine reads the file once per .search() call — there's no
-    persistent index, which keeps the alpha simple and means deleting the
-    file automatically purges history. v0.5.x can add an LRU cache.
+    persistent index for the substring path. Semantic mode keeps a
+    `.korg/embeddings.json` sidecar updated incrementally so only new
+    events need embedding on each call.
     """
 
-    def __init__(self, journal_path: Path | str):
+    def __init__(
+        self,
+        journal_path: Path | str,
+        *,
+        mode: RecallMode = "auto",
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    ):
         self.journal_path = Path(journal_path)
+        self.mode: RecallMode = mode
+        self.embedding_model = embedding_model
+        self._engine: EmbeddingEngine | None = None
+        self._cache: EmbeddingCache | None = None
+        # last_mode reflects which path actually ran on the most recent
+        # .search() — useful for callers (CLI) to label the output and
+        # for tests asserting on auto-fallback behaviour.
+        self.last_mode: str = mode
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -70,6 +101,33 @@ class RecallEngine:
         since: timedelta | None = None,
         limit: int = 10,
     ) -> list[Match]:
+        if self.mode == "semantic":
+            return self._search_semantic(query, kind=kind, since=since, limit=limit)
+        if self.mode == "auto":
+            try:
+                return self._search_semantic(
+                    query, kind=kind, since=since, limit=limit
+                )
+            except EmbeddingDependencyMissing:
+                # Silent fallback — auto mode is "use the best available."
+                # The CLI inspects last_mode for the output label.
+                self.last_mode = "substring (fastembed not installed)"
+                return self._search_substring(
+                    query, kind=kind, since=since, limit=limit
+                )
+        return self._search_substring(query, kind=kind, since=since, limit=limit)
+
+    # ── Substring path (v0.4.3) ───────────────────────────────────────
+
+    def _search_substring(
+        self,
+        query: str,
+        *,
+        kind: str | None,
+        since: timedelta | None,
+        limit: int,
+    ) -> list[Match]:
+        self.last_mode = "substring"
         terms = _tokenize(query)
         if not terms:
             return []
@@ -102,8 +160,6 @@ class RecallEngine:
                 continue
 
             snippet = _make_snippet(haystack, terms, SNIPPET_CONTEXT_CHARS)
-            # Score: total term hits, with a tiny recency bonus so a
-            # newer event beats an older event when hit counts tie.
             recency_bonus = _recency_bonus(ev_time)
             results.append(
                 Match(
@@ -116,9 +172,114 @@ class RecallEngine:
                 )
             )
 
-        # Highest score first; tie-break by seq_id descending (most-recent wins)
         results.sort(key=lambda m: (-m.score, -m.seq_id))
         return results[:limit]
+
+    # ── Semantic path (v0.5.2) ────────────────────────────────────────
+
+    def _search_semantic(
+        self,
+        query: str,
+        *,
+        kind: str | None,
+        since: timedelta | None,
+        limit: int,
+    ) -> list[Match]:
+        """Cosine-rank events against the query embedding.
+
+        Maintains `.korg/embeddings.json` next to the journal. On each call:
+        load all events → compute embeddings for any new ones → save cache
+        → embed query → cosine-rank → filter by kind/since/threshold → top N.
+        """
+        if not query.strip():
+            return []
+        events = self._load_events()
+        if not events:
+            self.last_mode = "semantic"
+            return []
+
+        # Lazy-build engine + cache on first semantic call.
+        if self._engine is None:
+            self._engine = EmbeddingEngine(model_name=self.embedding_model)
+        if self._cache is None:
+            self._cache = EmbeddingCache(
+                self._embeddings_path(),
+                model_name=self.embedding_model,
+            )
+
+        # Index events by seq for fast post-rank lookup.
+        events_by_seq = {
+            int(e["seq_id"]): e
+            for e in events
+            if isinstance(e.get("seq_id"), int)
+        }
+        all_seqs = sorted(events_by_seq.keys())
+
+        # Embed any events that aren't in the cache yet.
+        missing = self._cache.missing_seqs(all_seqs)
+        if missing:
+            texts = [text_for_event(events_by_seq[s]) for s in missing]
+            vectors = self._engine.embed_texts(texts)
+            self._cache.put_many(zip(missing, vectors))
+            self._cache.save()
+
+        # Embed the query.
+        try:
+            qvec = self._engine.embed_one(query)
+        except EmbeddingDependencyMissing:
+            raise  # propagate so auto mode can fall back
+        if not qvec:
+            return []
+
+        # Rank everything.
+        cache_seqs, cache_vectors = self._cache.all_vectors()
+        scores = batch_cosine(qvec, cache_vectors)
+
+        cutoff: datetime | None = None
+        if since is not None:
+            cutoff = datetime.now(tz=timezone.utc) - since
+
+        candidates: list[Match] = []
+        for seq, score in zip(cache_seqs, scores):
+            if score < SEMANTIC_MIN_SCORE:
+                continue
+            ev = events_by_seq.get(seq)
+            if ev is None:
+                continue
+            tool_name = ev.get("event", {}).get("tool_name", "")
+            if not _kind_match(kind, tool_name):
+                continue
+            ts_str = ev.get("event", {}).get("timestamp")
+            ev_time = _parse_timestamp(ts_str)
+            if cutoff is not None and ev_time is not None and ev_time < cutoff:
+                continue
+
+            # Snippet for semantic mode is just the head of the searchable
+            # text (no query terms to highlight). Keep the renderer
+            # consistent with substring mode so the CLI table layout is
+            # identical.
+            haystack = _searchable_text(ev)
+            snippet = haystack[: 2 * SNIPPET_CONTEXT_CHARS]
+            if len(haystack) > 2 * SNIPPET_CONTEXT_CHARS:
+                snippet += "…"
+
+            candidates.append(
+                Match(
+                    seq_id=seq,
+                    timestamp=ts_str or "",
+                    kind=tool_name,
+                    snippet=snippet,
+                    score=float(score),
+                    raw_event=ev,
+                )
+            )
+
+        candidates.sort(key=lambda m: (-m.score, -m.seq_id))
+        self.last_mode = "semantic"
+        return candidates[:limit]
+
+    def _embeddings_path(self) -> Path:
+        return self.journal_path.parent / "embeddings.json"
 
     # ── Helpers ────────────────────────────────────────────────────────
 
