@@ -105,6 +105,52 @@ The `user_prompt → llm_inference → tool_call*` shape mirrors what korgex
 emits, so a single ledger can host both interactive chat and autonomous
 agent runs without losing causal coherence.
 
+## Auto-context — ambient memory the LLM walks in with (v0.5.3)
+
+When you launch with `--auto-context`, every new user prompt triggers
+an automatic semantic `/recall` against the journal. The top relevant
+prior events get formatted as a preamble and prepended to the
+responder's view of the prompt. The model walks into each turn already
+knowing the relevant history — ChatGPT Memory but local, visible, and
+auditable.
+
+```
+$ korgchat --auto-context
+
+────────────────────────────────────────────────────────────
+ KorgChat 0.5.3
+ ...
+ auto-ctx:   ON (semantic /recall injected before each turn)
+ ...
+────────────────────────────────────────────────────────────
+
+You: how does the rust borrow checker prevent data races
+Korg: ...
+
+You: can you explain borrowing semantics one more time
+  🧠 [auto-context] injected 2 prior matches
+Korg: ...    ← model has been given the rust thread as context
+```
+
+The journal still records the **original** prompts, not the augmented
+ones. Auto-context lives in the LLM request, not in the audit log.
+
+Thresholds vs `/recall`:
+
+|                       | `/recall` (user-typed) | Auto-context (every turn) |
+|-----------------------|------------------------|---------------------------|
+| Default mode          | `auto`                  | `auto`                    |
+| Minimum cosine score  | 0.30                    | 0.40                      |
+| Top-N                 | 10                      | 3                         |
+
+Auto-injection is more aggressive than user search, so the bar is
+higher and the cap is tighter. When no event passes the threshold, no
+preamble is injected at all (the responder sees only the user's prompt).
+
+Without `fastembed` installed, auto-context falls back to substring
+matching (much noisier). Recommended install:
+`pip install korgchat[semantic]`.
+
 ## Semantic recall — search by meaning, not just words (v0.5.2)
 
 `/recall` now defaults to semantic mode when the optional `fastembed`

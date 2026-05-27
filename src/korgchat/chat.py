@@ -39,6 +39,10 @@ import korg_bridge
 from korgchat.branches import MAIN_BRANCH, BranchStore
 from korgchat.tools import ToolRegistry, default_tools
 
+# Auto-context import is lazy inside _build_auto_context() — pulls in
+# the embeddings stack (fastembed when available) which we don't want
+# to load until the session actually uses it.
+
 
 # ── Data shapes ────────────────────────────────────────────────────────────
 
@@ -515,7 +519,7 @@ class ChatSession:
     journal_path: Path
     responder: Responder
     tools: ToolRegistry = field(default_factory=default_tools)
-    source_agent: str = "agent:korgchat@0.5.0"
+    source_agent: str = "agent:korgchat@0.5.3"
     on_tool_call: Callable[[ToolCall], None] | None = None
     # v0.4.2: streaming callbacks. When `on_token` is set, the session routes
     # each LLM round through Responder.stream() so the caller sees text chunks
@@ -523,6 +527,16 @@ class ChatSession:
     # first token is requested) so a CLI can print a fresh "Korg: " prefix.
     on_token: Callable[[str], None] | None = None
     on_round_start: Callable[[], None] | None = None
+    # v0.5.3: when True, send() runs a semantic /recall on every user
+    # prompt and prepends a preamble of relevant prior events to the
+    # responder request. The user_prompt event in the journal still
+    # records the ORIGINAL prompt — auto-context lives in the LLM call,
+    # not in the audit log.
+    auto_context: bool = False
+    # Fired with (preamble_text, match_count) whenever an auto-context
+    # preamble is injected. CLI uses it to print a "🧠 [auto-context] …"
+    # indicator. None → no preamble injected this turn.
+    on_context_injected: Callable[[str, int], None] | None = None
     _bridge: korg_bridge.Bridge = field(init=False)
     _branches: BranchStore = field(init=False)
     # v0.5.0: which named branch is currently active. "main" = the implicit
@@ -615,9 +629,19 @@ class ChatSession:
                 triggered_by=self._last_llm_seq,
             )
 
+        # v0.5.3: optionally augment the responder's view of the prompt
+        # with relevant prior conversation, picked by semantic /recall.
+        # The journal already has the ORIGINAL prompt at `user_seq`; the
+        # `effective_prompt` only affects what the LLM sees.
+        effective_prompt = prompt
+        if self.auto_context:
+            preamble = self._build_auto_context(prompt, exclude_seq=user_seq)
+            if preamble:
+                effective_prompt = f"{preamble}\n\n— current user message —\n{prompt}"
+
         # Reset the per-turn Anthropic message buffer.
         self._anthropic_buf = self._build_history_messages()
-        self._anthropic_buf.append({"role": "user", "content": prompt})
+        self._anthropic_buf.append({"role": "user", "content": effective_prompt})
 
         # 2. Inner loop: ask responder, execute any tools, repeat until text.
         tool_calls: list[ToolCall] = []
@@ -633,7 +657,9 @@ class ChatSession:
         for iteration in range(MAX_TOOL_USE_ITERATIONS):
             if self.on_round_start is not None:
                 self.on_round_start()
-            reply = self._ask_responder(prompt)
+            # Pass the (potentially auto-context-augmented) prompt to the
+            # responder; mid-loop tool continuations don't re-augment.
+            reply = self._ask_responder(effective_prompt if iteration == 0 else prompt)
 
             t_inf = int((time.monotonic() - turn_start) * 1000) if iteration == 0 else 0
             # v0.4.3: pass assistant_text so /recall can search reply content.
@@ -814,6 +840,25 @@ class ChatSession:
                     on_token(text)
             final = stream.get_final_message()
         return AnthropicResponder._parse_final_message(final)
+
+    def _build_auto_context(self, prompt: str, *, exclude_seq: int) -> str | None:
+        """v0.5.3: ask the AutoContextEngine for a preamble for this prompt.
+
+        The engine is lazily imported + constructed so sessions without
+        auto_context never pay the embedding-stack import cost.
+        """
+        from korgchat.context import AutoContextEngine
+
+        engine = getattr(self, "_auto_ctx_engine", None)
+        if engine is None:
+            engine = AutoContextEngine(self)
+            self._auto_ctx_engine = engine
+        preamble = engine.build_preamble(prompt, exclude_seqs={exclude_seq})
+        if preamble and self.on_context_injected is not None:
+            # Count match lines (each starts with two-space "  • ").
+            n = preamble.count("\n  • ")
+            self.on_context_injected(preamble, n)
+        return preamble
 
     def _build_history_messages(self) -> list[dict[str, Any]]:
         """Convert prior Turns into Anthropic-shape user/assistant messages."""

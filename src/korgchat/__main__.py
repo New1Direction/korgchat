@@ -56,6 +56,14 @@ def _build_parser() -> argparse.ArgumentParser:
              "still one llm_inference event per LLM round either way.",
     )
     p.add_argument(
+        "--auto-context",
+        action="store_true",
+        help="Before each user prompt, run a semantic /recall and inject the "
+             "top relevant prior events as preamble for the responder. The "
+             "journal still records the original prompt (not the augmented "
+             "one). Local-first ambient memory.",
+    )
+    p.add_argument(
         "--stream-delay",
         type=float,
         default=0.005,
@@ -77,8 +85,18 @@ def _print_banner(session: ChatSession, mock: bool, streaming: bool) -> None:
     branch_count = len(session.branches.list())
     extra = f"  (+{branch_count} branch{'es' if branch_count != 1 else ''})" if branch_count else ""
     print(f" branch:     {session.current_branch}{extra}")
+    if session.auto_context:
+        print(f" auto-ctx:   ON (semantic /recall injected before each turn)")
     print(f" exit:       /quit, /exit, or Ctrl-D  (try /help for commands)")
     print(border)
+
+
+def _print_auto_context(_preamble: str, n_matches: int) -> None:
+    """Brief indicator that auto-context fired this turn. We don't print
+    the full preamble — that'd be noisy. The user sees enough to know
+    something happened; the actual injected text is in the LLM call."""
+    label = "match" if n_matches == 1 else "matches"
+    print(f"\n  🧠 [auto-context] injected {n_matches} prior {label}", flush=True)
 
 
 def _print_tool_call(call: ToolCall) -> None:
@@ -427,6 +445,8 @@ def _interactive_loop(
 ) -> int:
     """Read-eval-print loop. Returns the process exit code."""
     session.on_tool_call = _print_tool_call
+    if session.auto_context:
+        session.on_context_injected = _print_auto_context
     if streaming:
         streamer = _Streamer()
         session.on_round_start = streamer.on_round_start
@@ -495,6 +515,7 @@ def main(argv: list[str] | None = None) -> int:
     session = ChatSession(
         journal_path=Path(args.journal),
         responder=responder,
+        auto_context=args.auto_context,
     )
     _print_banner(session, mock=args.mock, streaming=streaming)
     return _interactive_loop(session, args.turns, streaming=streaming)

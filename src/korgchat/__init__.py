@@ -13,6 +13,7 @@ from korgchat.chat import (
     MAX_TOOL_USE_ITERATIONS,
 )
 from korgchat.branches import MAIN_BRANCH, Branch, BranchStore
+from korgchat.context import AutoContextEngine
 from korgchat.embeddings import (
     DEFAULT_EMBEDDING_MODEL,
     EmbeddingCache,
@@ -23,7 +24,7 @@ from korgchat.recall import Match, RecallEngine, format_matches
 from korgchat.summary import Summary, SummarizeEngine
 from korgchat.tools import Tool, ToolRegistry, default_tools
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 __all__ = [
     "__version__",
@@ -60,4 +61,6 @@ __all__ = [
     "EmbeddingCache",
     "EmbeddingDependencyMissing",
     "EmbeddingEngine",
+    # auto-context (v0.5.3)
+    "AutoContextEngine",
 ]

@@ -40,7 +40,7 @@ def _events(journal: Path) -> list[dict]:
 
 
 def test_version_string():
-    assert __version__ == "0.5.2"
+    assert __version__ == "0.5.3"
 
 
 # ── Single-turn text-only path (v0.4.0 carryover) ──────────────────────────
