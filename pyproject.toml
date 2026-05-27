@@ -1,0 +1,45 @@
+[build-system]
+requires      = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "korgchat"
+version         = "0.4.0"
+description     = "KorgChat — the first chat product built on the Korg cognitive ledger. Every turn recorded via korg-bridge."
+readme          = "README.md"
+license         = { text = "MIT" }
+requires-python = ">=3.9"
+authors         = [{ name = "Korg ecosystem maintainers" }]
+classifiers     = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+]
+# korg_bridge is the in-process Rust WAL adapter built by maturin in the
+# Korg workspace. Install with:  pip install -e ../Korg/crates/korg-bridge
+# Anthropic SDK is optional — KorgChat works in --mock mode without it.
+dependencies = [
+    "korg_bridge>=0.3.1,<0.4.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40.0,<1.0.0"]
+dev       = ["pytest>=8.0.0,<9.0.0"]
+
+[project.scripts]
+korgchat = "korgchat.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["korgchat*"]
+
+[tool.pytest.ini_options]
+testpaths      = ["tests"]
+python_files   = ["test_*.py"]

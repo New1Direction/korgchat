@@ -1,0 +1,16 @@
+# Python build / install artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.hypothesis/
+
+# Virtualenv
+.venv/
+venv/
+
+# Ledger output from local runs
+.korg/
+*.lock
