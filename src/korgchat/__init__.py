@@ -14,7 +14,7 @@ from korgchat.chat import (
 )
 from korgchat.tools import Tool, ToolRegistry, default_tools
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 __all__ = [
     "__version__",

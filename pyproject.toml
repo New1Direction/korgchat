@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "korgchat"
-version         = "0.4.1"
+version         = "0.4.2"
 description     = "KorgChat — the first chat product built on the Korg cognitive ledger. Every turn recorded via korg-bridge."
 readme          = "README.md"
 license         = { text = "MIT" }

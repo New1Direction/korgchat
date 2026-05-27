@@ -146,6 +146,36 @@ class Responder(abc.ABC):
         Returning a Reply with `wants_tools=False` ends the turn.
         """
 
+    def stream(
+        self,
+        *,
+        history: list[Turn],
+        prompt: str,
+        prior_tool_results: list[ToolResult] | None = None,
+        tools: ToolRegistry | None = None,
+        on_token: Callable[[str], None] | None = None,
+    ) -> Reply:
+        """Streaming variant. Calls `on_token(chunk)` as text becomes
+        available, returns the same Reply shape as `respond()` at the end.
+
+        Default implementation = block on respond(), then emit the full text
+        as a single chunk. Subclasses with real streaming protocols
+        (Anthropic, MockResponder with delay) override this for incremental
+        delivery.
+
+        The journal still records one atomic `llm_inference` event per call
+        with the full text — streaming is a CLI/UX feature only.
+        """
+        reply = self.respond(
+            history=history,
+            prompt=prompt,
+            prior_tool_results=prior_tool_results,
+            tools=tools,
+        )
+        if on_token is not None and reply.text:
+            on_token(reply.text)
+        return reply
+
 
 class MockResponder(Responder):
     """Deterministic responder for offline use, CI, and tests.
@@ -172,8 +202,17 @@ class MockResponder(Responder):
 
     _TOOL_MARKER_RE = re.compile(r"\[tool:([a-zA-Z_][a-zA-Z0-9_]*)\(([^\]]*?)\)\]")
 
-    def __init__(self, replies: list[Reply] | None = None) -> None:
+    def __init__(
+        self,
+        replies: list[Reply] | None = None,
+        *,
+        stream_delay_secs: float = 0.0,
+    ) -> None:
         self._scripted = list(replies) if replies is not None else None
+        # Pause between simulated token chunks during stream(). 0 keeps tests
+        # fast and deterministic; CLI runs default to a small visible delay so
+        # the user actually sees a streaming effect with the mock responder.
+        self._stream_delay_secs = stream_delay_secs
 
     @property
     def model(self) -> str:
@@ -278,6 +317,31 @@ class MockResponder(Responder):
                 parts.append(f"{r.id} → {json.dumps(r.output, sort_keys=True)}")
         return " | ".join(parts)
 
+    def stream(
+        self,
+        *,
+        history: list[Turn],
+        prompt: str,
+        prior_tool_results: list[ToolResult] | None = None,
+        tools: ToolRegistry | None = None,
+        on_token: Callable[[str], None] | None = None,
+    ) -> Reply:
+        """Simulate a token-by-token stream by emitting one character at a
+        time. `stream_delay_secs` (constructor param) controls the gap
+        between chunks — 0 for tests, ~0.005 for visible CLI streaming."""
+        reply = self.respond(
+            history=history,
+            prompt=prompt,
+            prior_tool_results=prior_tool_results,
+            tools=tools,
+        )
+        if on_token is not None and reply.text:
+            for ch in reply.text:
+                on_token(ch)
+                if self._stream_delay_secs > 0:
+                    time.sleep(self._stream_delay_secs)
+        return reply
+
 
 class AnthropicResponder(Responder):
     """Live Anthropic-backed responder with tool-use support.
@@ -380,6 +444,13 @@ class AnthropicResponder(Responder):
             completion_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
         )
 
+    @staticmethod
+    def _parse_final_message(final_msg: Any) -> Reply:
+        """Same shape as _parse_response but for messages.stream()'s
+        get_final_message(). The two API surfaces return very similar objects;
+        we keep them as two adapters in case Anthropic drifts them later."""
+        return AnthropicResponder._parse_response(final_msg)
+
 
 # ── Session ────────────────────────────────────────────────────────────────
 
@@ -395,8 +466,14 @@ class ChatSession:
     journal_path: Path
     responder: Responder
     tools: ToolRegistry = field(default_factory=default_tools)
-    source_agent: str = "agent:korgchat@0.4.1"
+    source_agent: str = "agent:korgchat@0.4.2"
     on_tool_call: Callable[[ToolCall], None] | None = None
+    # v0.4.2: streaming callbacks. When `on_token` is set, the session routes
+    # each LLM round through Responder.stream() so the caller sees text chunks
+    # as they arrive. `on_round_start` fires once per LLM round (before the
+    # first token is requested) so a CLI can print a fresh "Korg: " prefix.
+    on_token: Callable[[str], None] | None = None
+    on_round_start: Callable[[], None] | None = None
     _bridge: korg_bridge.Bridge = field(init=False)
     _history: list[Turn] = field(default_factory=list, init=False)
     _last_llm_seq: int | None = field(default=None, init=False)
@@ -455,6 +532,8 @@ class ChatSession:
         prior_llm_seq: int = user_seq
 
         for iteration in range(MAX_TOOL_USE_ITERATIONS):
+            if self.on_round_start is not None:
+                self.on_round_start()
             reply = self._ask_responder(prompt)
 
             t_inf = int((time.monotonic() - turn_start) * 1000) if iteration == 0 else 0
@@ -555,11 +634,26 @@ class ChatSession:
 
     def _ask_responder(self, prompt: str) -> Reply:
         """Dispatch to the responder. Routes Anthropic mode through the
-        stateful message buffer; mock/other modes get the simpler interface."""
+        stateful message buffer; mock/other modes get the simpler interface.
+
+        When `on_token` is set on the session, takes the streaming code path
+        so text chunks reach the caller as they're produced. The journal
+        still gets one atomic llm_inference event per round."""
         pending = getattr(self, "_pending_results", None)
-        if isinstance(self.responder, AnthropicResponder):
-            return self._anthropic_continue(prompt)
+        streaming = self.on_token is not None
         try:
+            if isinstance(self.responder, AnthropicResponder):
+                if streaming:
+                    return self._anthropic_continue_stream(prompt)
+                return self._anthropic_continue(prompt)
+            if streaming:
+                return self.responder.stream(
+                    history=self._history,
+                    prompt=prompt,
+                    prior_tool_results=pending,
+                    tools=self.tools,
+                    on_token=self.on_token,
+                )
             return self.responder.respond(
                 history=self._history,
                 prompt=prompt,
@@ -583,6 +677,35 @@ class ChatSession:
             kwargs["tools"] = self.tools.to_anthropic_tools()
         resp = client.messages.create(**kwargs)
         return AnthropicResponder._parse_response(resp)
+
+    def _anthropic_continue_stream(self, prompt: str) -> Reply:
+        """Streaming variant: call `client.messages.stream()` and fire
+        `self.on_token` for every text_delta. The accumulated final message
+        is parsed into the Reply we return so the rest of send() works
+        unchanged.
+
+        Only text deltas stream; tool_use blocks are emitted by Anthropic
+        as complete units inside the assistant message and are surfaced via
+        the final Reply, not as token chunks.
+        """
+        import anthropic
+
+        client = anthropic.Anthropic()
+        kwargs: dict[str, Any] = {
+            "model": self.responder.model,
+            "max_tokens": getattr(self.responder, "_max_tokens", 2048),
+            "messages": self._anthropic_buf,
+        }
+        if len(self.tools) > 0:
+            kwargs["tools"] = self.tools.to_anthropic_tools()
+
+        on_token = self.on_token  # local alias — set above _ask_responder check
+        with client.messages.stream(**kwargs) as stream:
+            for text in stream.text_stream:
+                if on_token is not None and text:
+                    on_token(text)
+            final = stream.get_final_message()
+        return AnthropicResponder._parse_final_message(final)
 
     def _build_history_messages(self) -> list[dict[str, Any]]:
         """Convert prior Turns into Anthropic-shape user/assistant messages."""

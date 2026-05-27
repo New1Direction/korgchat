@@ -40,7 +40,7 @@ def _events(journal: Path) -> list[dict]:
 
 
 def test_version_string():
-    assert __version__ == "0.4.1"
+    assert __version__ == "0.4.2"
 
 
 # ── Single-turn text-only path (v0.4.0 carryover) ──────────────────────────
@@ -284,18 +284,136 @@ def test_free_mode_tool_marker(tmp_journal):
     assert turn.tool_calls[0].result == {"sum": 10}
 
 
+# ── v0.4.2 streaming ──────────────────────────────────────────────────────
+
+
+def test_stream_emits_full_text_in_chunks(tmp_journal):
+    """on_token receives one chunk per char (for MockResponder); concatenating
+    them rebuilds the full assistant text."""
+    chunks: list[str] = []
+    s = ChatSession(
+        journal_path=tmp_journal,
+        responder=MockResponder(stream_delay_secs=0.0),
+    )
+    s.on_token = chunks.append
+    turn = s.send("hello streaming world")
+    # MockResponder.stream emits one char per on_token call.
+    assert "".join(chunks) == turn.assistant_text
+    assert len(chunks) == len(turn.assistant_text)
+
+
+def test_stream_default_unscripted_still_writes_journal(tmp_journal):
+    """Streaming is a UX layer; the journal still records one llm_inference
+    event per round with the full text."""
+    s = ChatSession(
+        journal_path=tmp_journal,
+        responder=MockResponder(stream_delay_secs=0.0),
+    )
+    s.on_token = lambda _c: None
+    turn = s.send("first turn")
+    events = _events(tmp_journal)
+    assert len(events) == 2
+    assert events[1]["event"]["tool_name"] == "llm_inference"
+    # Mock's hash-bucketed reply must match the on-disk record. The bridge
+    # stores the assistant text in args/result for llm_inference events,
+    # but the public surface is turn.assistant_text — which is what we
+    # care about being non-empty + reconstructable.
+    assert turn.assistant_text
+
+
+def test_stream_round_start_fires_once_per_round(tmp_journal):
+    """A two-round tool-use turn fires on_round_start twice."""
+    round_starts = 0
+
+    def bump():
+        nonlocal round_starts
+        round_starts += 1
+
+    responder = MockResponder(
+        replies=[
+            Reply(tool_uses=[ToolUse(id="t1", name="add", input={"a": 1, "b": 2})]),
+            Reply(text="result is 3"),
+        ]
+    )
+    s = ChatSession(journal_path=tmp_journal, responder=responder)
+    s.on_round_start = bump
+    # Make sure streaming is active so the round-start path matters too.
+    s.on_token = lambda _c: None
+    s.send("compute")
+    assert round_starts == 2  # one per LLM round
+
+
+def test_stream_skip_when_round_has_no_text(tmp_journal):
+    """A tool-only round produces no on_token calls, but on_round_start fires."""
+    rounds = 0
+    chunks: list[str] = []
+
+    def round_start():
+        nonlocal rounds
+        rounds += 1
+
+    responder = MockResponder(
+        replies=[
+            Reply(tool_uses=[ToolUse(id="t1", name="echo", input={"input": "x"})]),
+            Reply(text="done"),
+        ]
+    )
+    s = ChatSession(journal_path=tmp_journal, responder=responder)
+    s.on_round_start = round_start
+    s.on_token = chunks.append
+    s.send("go")
+    assert rounds == 2
+    # Round 1 emitted no tokens (tool-only); round 2 emitted "done".
+    assert "".join(chunks) == "done"
+
+
+def test_stream_default_responder_yields_full_text_at_once(tmp_journal):
+    """The Responder.stream() default impl (no override) should still feed
+    on_token — once, with the full text."""
+
+    class PlainResponder(MockResponder):
+        # MockResponder overrides stream(); make a subclass that *doesn't*
+        # so we hit the Responder.stream default path.
+        def stream(self, **kwargs):  # type: ignore[override]
+            from korgchat.chat import Responder
+            return Responder.stream(self, **kwargs)
+
+    chunks: list[str] = []
+    s = ChatSession(journal_path=tmp_journal, responder=PlainResponder())
+    s.on_token = chunks.append
+    s.send("hello")
+    # Default impl: one chunk containing the entire reply.
+    assert len(chunks) == 1
+    assert chunks[0]  # non-empty
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────
 
 
 def test_cli_mock_three_text_turns(tmp_journal, monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", io.StringIO("hello\nhow are you\nbye\n"))
-    rc = cli_main(["--mock", "--journal", str(tmp_journal)])
+    # Use --stream-delay=0 to keep tests fast.
+    rc = cli_main(["--mock", "--journal", str(tmp_journal), "--stream-delay", "0"])
     assert rc == 0
     events = _events(tmp_journal)
     assert len(events) == 6
     out = capsys.readouterr().out
     assert "KorgChat" in out
     assert out.count("[recorded:") == 3
+    # Streaming default produces visible "Korg: " prefix per turn.
+    assert out.count("Korg: ") == 3
+
+
+def test_cli_no_stream_flag_atomic_print(tmp_journal, monkeypatch, capsys):
+    """--no-stream produces a single atomic print per turn (the v0.4.0 UX)."""
+    monkeypatch.setattr("sys.stdin", io.StringIO("hi\n/quit\n"))
+    rc = cli_main(["--mock", "--journal", str(tmp_journal), "--no-stream"])
+    assert rc == 0
+    events = _events(tmp_journal)
+    assert len(events) == 2
+    out = capsys.readouterr().out
+    assert "(--no-stream)" in out
+    assert "Korg: " in out
 
 
 def test_cli_tool_marker_run(tmp_journal, monkeypatch, capsys):

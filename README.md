@@ -52,6 +52,35 @@ korgchat
 
 # Pick a custom journal location:
 korgchat --journal ./my-conversation.json --mock
+
+# Disable streaming (atomic per-turn print, v0.4.0 UX):
+korgchat --mock --no-stream
+
+# Tune mock-mode streaming speed (default 0.005s/char):
+korgchat --mock --stream-delay 0.05      # slow & visible
+korgchat --mock --stream-delay 0         # instant
+```
+
+## Streaming (v0.4.2)
+
+By default, every assistant text reply streams to stdout character-by-character
+as it's produced. With `AnthropicResponder` this uses the SDK's
+`messages.stream()` and renders tokens as they arrive from the API; with
+`MockResponder` it emits one character at a time with a configurable delay
+so the streaming effect is visible offline.
+
+The journal contract is unchanged: every LLM round still produces exactly
+one `llm_inference` event containing the full reply text. Streaming is a
+CLI/UX layer, not a protocol change.
+
+Embedders can attach streaming callbacks to any `ChatSession`:
+
+```python
+chunks = []
+session.on_round_start = lambda: print("\nKorg: ", end="", flush=True)
+session.on_token       = lambda c: (chunks.append(c), print(c, end="", flush=True))
+session.send("hello")
+# chunks reconstructs the full text the model produced.
 ```
 
 ## Causal chain
