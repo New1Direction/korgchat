@@ -12,9 +12,10 @@ from korgchat.chat import (
     Turn,
     MAX_TOOL_USE_ITERATIONS,
 )
+from korgchat.recall import Match, RecallEngine, format_matches
 from korgchat.tools import Tool, ToolRegistry, default_tools
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 __all__ = [
     "__version__",
@@ -35,4 +36,8 @@ __all__ = [
     "Tool",
     "ToolRegistry",
     "default_tools",
+    # recall (v0.4.3)
+    "Match",
+    "RecallEngine",
+    "format_matches",
 ]

@@ -105,6 +105,45 @@ The `user_prompt → llm_inference → tool_call*` shape mirrors what korgex
 emits, so a single ledger can host both interactive chat and autonomous
 agent runs without losing causal coherence.
 
+## Recall — search your conversations (v0.4.3)
+
+Every event KorgChat writes — user prompts, model replies, tool calls, tool
+results — is searchable from inside the chat itself. No cloud, no embedding
+model, no SDK setup: substring-grep over the local journal, AND-of-terms.
+
+```
+You: tell me about rust ownership
+Korg: ...
+
+You: /recall rust
+[recall] 2 match(es) for 'rust':
+  seq=1     2026-05-27 09:04   user_prompt     tell me about rust ownership…
+  seq=2     2026-05-27 09:04   llm_inference   …rust borrow checker tracks…
+
+You: /recall --kind tool_call add
+[recall] 1 match(es) for 'add':
+  seq=7     2026-05-27 09:04   add             add
+
+You: /recall --since 24h "borrow checker"
+You: /recall --limit 3 ledger
+```
+
+Flags:
+
+| Flag         | Effect                                                          |
+|--------------|-----------------------------------------------------------------|
+| `--kind K`   | Filter to `user_prompt` / `llm_inference` / `tool_call` / `<name>` |
+| `--since DUR`| `30m`, `24h`, `7d`, `1.5h` — only events newer than that         |
+| `--limit N`  | Cap returned matches (default 10)                                |
+
+`/help` lists every slash command.
+
+What's distinctive vs ChatGPT/Claude.ai sidebar search: this works against
+the *complete* event log including model replies and tool calls (not just
+prompt titles), uses an open file format (`.korg/journal.json`), and runs
+entirely local-first. The same data is consumable by `korg-server` MCP
+browsing and `korg-tui` Ctrl-R rewind without a second copy.
+
 ## Tools (v0.4.1)
 
 KorgChat ships three deterministic built-in tools:

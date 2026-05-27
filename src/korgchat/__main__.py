@@ -5,11 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 from korgchat import __version__
 from korgchat.chat import ChatSession, MockResponder, ToolCall, select_responder
+from korgchat.recall import RecallEngine, format_matches
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -87,6 +90,108 @@ def _print_tool_call(call: ToolCall) -> None:
           f"(seq={call.seq}, {call.duration_ms}ms)")
 
 
+# ── Slash-command dispatch ────────────────────────────────────────────────
+
+# Sentinels returned by slash-command handlers so the REPL knows what to do.
+_SLASH_HANDLED = object()   # command consumed the line, keep looping
+_SLASH_EXIT    = object()   # command asked the REPL to exit (code 0)
+
+
+def _cmd_help(_args: str, _session: ChatSession) -> object:
+    print(
+        "\nKorgChat slash commands:\n"
+        "  /help                 — this list\n"
+        "  /recall <query>       — search prior turns (substring, AND of terms)\n"
+        "  /recall --kind K Q    — filter by event kind: user_prompt | llm_inference | tool_call\n"
+        "  /recall --since 7d Q  — only events from the last N days (or 24h, 30m, ...)\n"
+        "  /recall --limit N Q   — cap matches (default 10)\n"
+        "  /quit, /exit          — leave the REPL\n"
+    )
+    return _SLASH_HANDLED
+
+
+_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)([smhd])$")
+
+
+def _parse_duration(s: str) -> timedelta | None:
+    """Accept '30m', '24h', '7d', '90s', or '1.5h'. None on bad input."""
+    m = _DURATION_RE.match(s.strip().lower())
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2)
+    return {
+        "s": timedelta(seconds=val),
+        "m": timedelta(minutes=val),
+        "h": timedelta(hours=val),
+        "d": timedelta(days=val),
+    }[unit]
+
+
+def _cmd_recall(args: str, session: ChatSession) -> object:
+    """Parse `/recall [--kind K] [--since DUR] [--limit N] <query>` and run."""
+    kind: str | None = None
+    since: timedelta | None = None
+    limit = 10
+    tokens = args.split()
+    positional: list[str] = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "--kind" and i + 1 < len(tokens):
+            kind = tokens[i + 1]
+            i += 2
+        elif t == "--since" and i + 1 < len(tokens):
+            d = _parse_duration(tokens[i + 1])
+            if d is None:
+                print(f"[recall] bad --since duration: {tokens[i + 1]!r}; expected e.g. 7d, 24h, 30m")
+                return _SLASH_HANDLED
+            since = d
+            i += 2
+        elif t == "--limit" and i + 1 < len(tokens):
+            try:
+                limit = max(1, int(tokens[i + 1]))
+            except ValueError:
+                print(f"[recall] bad --limit: {tokens[i + 1]!r}; expected an integer")
+                return _SLASH_HANDLED
+            i += 2
+        else:
+            positional.append(t)
+            i += 1
+
+    query = " ".join(positional).strip()
+    if not query:
+        print("[recall] usage: /recall [--kind K] [--since DUR] [--limit N] <query>")
+        return _SLASH_HANDLED
+
+    engine = RecallEngine(session.journal_path)
+    matches = engine.search(query, kind=kind, since=since, limit=limit)
+    print("\n" + format_matches(matches, query=query))
+    return _SLASH_HANDLED
+
+
+_SLASH_COMMANDS = {
+    "/help": _cmd_help,
+    "/recall": _cmd_recall,
+}
+
+
+def _maybe_handle_slash(prompt: str, session: ChatSession) -> object | None:
+    """Return _SLASH_HANDLED / _SLASH_EXIT if the prompt was a slash command,
+    or None to let it fall through to the responder."""
+    if not prompt.startswith("/"):
+        return None
+    head, _, rest = prompt.partition(" ")
+    head_lower = head.lower()
+    if head_lower in {"/quit", "/exit"}:
+        return _SLASH_EXIT
+    handler = _SLASH_COMMANDS.get(head_lower)
+    if handler is None:
+        print(f"[korgchat] unknown command {head!r} — try /help")
+        return _SLASH_HANDLED
+    return handler(rest, session)
+
+
 class _Streamer:
     """Stdout streamer that prints a fresh `Korg: ` prefix on the first
     token of each LLM round, then flushes each subsequent chunk inline.
@@ -134,8 +239,13 @@ def _interactive_loop(
         prompt = prompt.strip()
         if not prompt:
             continue
-        if prompt.lower() in {"/quit", "/exit"}:
+
+        # Slash-command dispatch — runs before we touch the responder.
+        slash_result = _maybe_handle_slash(prompt, session)
+        if slash_result is _SLASH_EXIT:
             return 0
+        if slash_result is _SLASH_HANDLED:
+            continue
 
         try:
             turn = session.send(prompt)

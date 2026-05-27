@@ -466,7 +466,7 @@ class ChatSession:
     journal_path: Path
     responder: Responder
     tools: ToolRegistry = field(default_factory=default_tools)
-    source_agent: str = "agent:korgchat@0.4.2"
+    source_agent: str = "agent:korgchat@0.4.3"
     on_tool_call: Callable[[ToolCall], None] | None = None
     # v0.4.2: streaming callbacks. When `on_token` is set, the session routes
     # each LLM round through Responder.stream() so the caller sees text chunks
@@ -537,6 +537,9 @@ class ChatSession:
             reply = self._ask_responder(prompt)
 
             t_inf = int((time.monotonic() - turn_start) * 1000) if iteration == 0 else 0
+            # v0.4.3: pass assistant_text so /recall can search reply content.
+            # Empty text (e.g. tool-only rounds) records None so the result
+            # object stays minimal for those events.
             llm_seq = self._bridge.record_llm_call(
                 model=self.responder.model,
                 prompt_tokens=int(reply.prompt_tokens),
@@ -544,6 +547,7 @@ class ChatSession:
                 duration_ms=t_inf,
                 triggered_by=prior_llm_seq,
                 source_agent=self.source_agent,
+                assistant_text=reply.text if reply.text else None,
             )
             producing_llm_seq = llm_seq
 

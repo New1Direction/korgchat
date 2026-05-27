@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "korgchat"
-version         = "0.4.2"
+version         = "0.4.3"
 description     = "KorgChat — the first chat product built on the Korg cognitive ledger. Every turn recorded via korg-bridge."
 readme          = "README.md"
 license         = { text = "MIT" }
@@ -26,7 +26,7 @@ classifiers     = [
 # Korg workspace. Install with:  pip install -e ../Korg/crates/korg-bridge
 # Anthropic SDK is optional — KorgChat works in --mock mode without it.
 dependencies = [
-    "korg_bridge>=0.3.1,<0.4.0",
+    "korg_bridge>=0.3.2,<0.4.0",
 ]
 
 [project.optional-dependencies]
