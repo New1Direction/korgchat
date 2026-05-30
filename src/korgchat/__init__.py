@@ -13,7 +13,7 @@ from korgchat.chat import (
     MAX_TOOL_USE_ITERATIONS,
 )
 from korgchat.branches import MAIN_BRANCH, Branch, BranchStore
-from korgchat.context import AutoContextEngine
+from korgchat.context import AutoContextEngine, ContextInjection
 from korgchat.embeddings import (
     DEFAULT_EMBEDDING_MODEL,
     EmbeddingCache,
@@ -63,4 +63,5 @@ __all__ = [
     "EmbeddingEngine",
     # auto-context (v0.5.3)
     "AutoContextEngine",
+    "ContextInjection",
 ]

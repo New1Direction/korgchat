@@ -263,6 +263,27 @@ def _render_event_line(ev: dict) -> str:
         text = body.get("result", {}).get("text", "")
         scope = body.get("args", {}).get("scope", "?")
         return f"[seq={seq} {ts}] PRIOR SUMMARY ({scope}): {_truncate(text, 200)}"
+    if tool == "context_injection":
+        # Auto-context recall — meta, not a tool the user invoked. Render it
+        # distinctly so digests don't miscount it as a tool call.
+        result = body.get("result", {})
+        query = body.get("args", {}).get("query", "")
+        n = result.get("match_count", 0)
+        return (
+            f"[seq={seq} {ts}] context: auto-recalled {n} prior event(s) "
+            f"for {_truncate(json.dumps(query), 80)}"
+        )
+    if tool in ("tool_schema_snapshot", "tool_validation"):
+        # Audit-trail meta-events bracketing a real tool call. Keep them out
+        # of the "tool invocation" tally — they describe a call, they aren't
+        # one. Render on their own line shape (no leading "tool ").
+        target = body.get("args", {}).get("tool_name", "?")
+        if tool == "tool_schema_snapshot":
+            h = (body.get("result", {}).get("schema_hash") or "")[:12]
+            return f"[seq={seq} {ts}] schema-snapshot {target} (hash={h})"
+        result = body.get("result", {})
+        verdict = "valid" if result.get("valid") else "INVALID"
+        return f"[seq={seq} {ts}] schema-validation {target} → {verdict}"
     # Generic tool call.
     args = body.get("args", {})
     result = body.get("result", {})

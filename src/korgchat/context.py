@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from korgchat.recall import RecallEngine
+from korgchat.recall import Match, RecallEngine
 
 if TYPE_CHECKING:
     from korgchat.chat import ChatSession
@@ -41,6 +41,46 @@ PREAMBLE_FOOTER = (
     "Use this context to inform your reply when relevant. "
     "Don't quote it back to the user verbatim."
 )
+
+
+@dataclass
+class ContextInjection:
+    """The result of an auto-context recall: the rendered preamble plus the
+    structured matches that produced it.
+
+    `build_context()` returns this so callers (ChatSession) can both inject
+    the preamble into the responder request AND record a first-class
+    `context_injection` ledger event capturing exactly which prior events
+    (seq_id + score) were surfaced. Without the structured matches the
+    injected context would stay a "ghost" — visible to the model but
+    invisible to the audit log.
+    """
+
+    query: str               # the prompt that drove the recall
+    preamble: str            # the formatted text prepended to the responder request
+    matches: list[Match]     # the prior events that qualified, best-first
+    top_n: int
+    min_score: float
+    mode: str                # which recall path actually ran ("semantic" / "substring")
+
+    @property
+    def match_count(self) -> int:
+        return len(self.matches)
+
+    def matches_as_records(self) -> list[dict]:
+        """Flatten matches into JSON-serialisable dicts for the ledger
+        event's `result.matches`. Deliberately minimal — seq_id, score,
+        kind, timestamp — so a replay can re-point at the source events
+        without duplicating their full bodies (those are already on disk)."""
+        return [
+            {
+                "seq_id": m.seq_id,
+                "score": round(float(m.score), 6),
+                "kind": m.kind,
+                "timestamp": m.timestamp,
+            }
+            for m in self.matches
+        ]
 
 
 @dataclass
@@ -63,8 +103,17 @@ class AutoContextEngine:
         # user's fault for asking).
         self._recall = RecallEngine(self.session.journal_path, mode="auto")
 
-    def build_preamble(self, prompt: str, *, exclude_seqs: set[int] | None = None) -> str | None:
-        """Return a formatted preamble string or None if no matches qualify."""
+    def build_context(
+        self, prompt: str, *, exclude_seqs: set[int] | None = None
+    ) -> ContextInjection | None:
+        """Run the recall, filter to qualifying matches, and return both the
+        rendered preamble and the structured matches — or None if nothing
+        passes the threshold.
+
+        This is the primitive `build_preamble()` is built on; ChatSession
+        uses it directly so it can record a `context_injection` ledger
+        event alongside the (otherwise invisible) prompt augmentation.
+        """
         if not prompt or not prompt.strip():
             return None
 
@@ -82,8 +131,28 @@ class AutoContextEngine:
         if not qualified:
             return None
 
+        preamble = self._render_preamble(qualified)
+        return ContextInjection(
+            query=prompt,
+            preamble=preamble,
+            matches=qualified,
+            top_n=self.top_n,
+            min_score=self.min_score,
+            mode=self._recall.last_mode,
+        )
+
+    def build_preamble(self, prompt: str, *, exclude_seqs: set[int] | None = None) -> str | None:
+        """Return a formatted preamble string or None if no matches qualify.
+
+        Thin wrapper over `build_context()` for callers that only need the
+        text and don't care about the structured matches."""
+        ctx = self.build_context(prompt, exclude_seqs=exclude_seqs)
+        return ctx.preamble if ctx is not None else None
+
+    @staticmethod
+    def _render_preamble(matches: list[Match]) -> str:
         lines = [PREAMBLE_HEADER]
-        for h in qualified:
+        for h in matches:
             short_ts = (h.timestamp or "")[:10]  # YYYY-MM-DD
             lines.append(
                 f"  • [{h.kind} seq={h.seq_id} {short_ts} score={h.score:.2f}] "

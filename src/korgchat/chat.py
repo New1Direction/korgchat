@@ -32,7 +32,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import korg_bridge
 
@@ -41,7 +41,10 @@ from korgchat.tools import ToolRegistry, default_tools
 
 # Auto-context import is lazy inside _build_auto_context() — pulls in
 # the embeddings stack (fastembed when available) which we don't want
-# to load until the session actually uses it.
+# to load until the session actually uses it. The type is imported under
+# TYPE_CHECKING only so annotations resolve without the eager import.
+if TYPE_CHECKING:
+    from korgchat.context import ContextInjection
 
 
 # ── Data shapes ────────────────────────────────────────────────────────────
@@ -633,11 +636,24 @@ class ChatSession:
         # with relevant prior conversation, picked by semantic /recall.
         # The journal already has the ORIGINAL prompt at `user_seq`; the
         # `effective_prompt` only affects what the LLM sees.
+        #
+        # task #5: the injected context is no longer a ghost. When a
+        # preamble is built we record a first-class `context_injection`
+        # event capturing the preamble text, the recall query, and the
+        # matched seq_ids + scores, causally chained
+        #   user_prompt → context_injection → llm_inference
+        # so a replay can reconstruct exactly what the model was shown.
         effective_prompt = prompt
+        injection_seq: int | None = None
         if self.auto_context:
-            preamble = self._build_auto_context(prompt, exclude_seq=user_seq)
-            if preamble:
-                effective_prompt = f"{preamble}\n\n— current user message —\n{prompt}"
+            ctx = self._build_auto_context(prompt, exclude_seq=user_seq)
+            if ctx is not None:
+                effective_prompt = (
+                    f"{ctx.preamble}\n\n— current user message —\n{prompt}"
+                )
+                injection_seq = self._record_context_injection(
+                    ctx, triggered_by=user_seq
+                )
 
         # Reset the per-turn Anthropic message buffer.
         self._anthropic_buf = self._build_history_messages()
@@ -650,9 +666,11 @@ class ChatSession:
         # llm_inference will chain back to it per spec §2a.
         producing_llm_seq: int | None = None
         # `prior_llm_seq` is what each new llm_inference will use for
-        # triggered_by. For the first round this is `user_seq`; for round 2+
-        # it's the *previous* llm_inference (§2a).
-        prior_llm_seq: int = user_seq
+        # triggered_by. For the first round this is `user_seq` — or the
+        # `context_injection` seq when auto-context injected a preamble, so
+        # the inference chains from the context the model actually saw
+        # (task #5). For round 2+ it's the *previous* llm_inference (§2a).
+        prior_llm_seq: int = injection_seq if injection_seq is not None else user_seq
 
         for iteration in range(MAX_TOOL_USE_ITERATIONS):
             if self.on_round_start is not None:
@@ -841,8 +859,13 @@ class ChatSession:
             final = stream.get_final_message()
         return AnthropicResponder._parse_final_message(final)
 
-    def _build_auto_context(self, prompt: str, *, exclude_seq: int) -> str | None:
-        """v0.5.3: ask the AutoContextEngine for a preamble for this prompt.
+    def _build_auto_context(
+        self, prompt: str, *, exclude_seq: int
+    ) -> "ContextInjection | None":
+        """v0.5.3: ask the AutoContextEngine for a recall context for this
+        prompt. Returns the full ContextInjection (preamble + structured
+        matches) so send() can both augment the prompt AND record the
+        injection on the ledger (task #5).
 
         The engine is lazily imported + constructed so sessions without
         auto_context never pay the embedding-stack import cost.
@@ -853,12 +876,38 @@ class ChatSession:
         if engine is None:
             engine = AutoContextEngine(self)
             self._auto_ctx_engine = engine
-        preamble = engine.build_preamble(prompt, exclude_seqs={exclude_seq})
-        if preamble and self.on_context_injected is not None:
-            # Count match lines (each starts with two-space "  • ").
-            n = preamble.count("\n  • ")
-            self.on_context_injected(preamble, n)
-        return preamble
+        ctx = engine.build_context(prompt, exclude_seqs={exclude_seq})
+        if ctx is not None and self.on_context_injected is not None:
+            self.on_context_injected(ctx.preamble, ctx.match_count)
+        return ctx
+
+    def _record_context_injection(
+        self, ctx: "ContextInjection", *, triggered_by: int
+    ) -> int:
+        """Record the auto-context preamble as a first-class ledger event.
+
+        Sits causally between the user_prompt (`triggered_by`) and the
+        llm_inference it feeds. `args` carries the recall parameters; the
+        bulkier preamble text + matched seq_ids/scores live in `result`.
+        """
+        return self._bridge.record_tool_call(
+            source_agent=self.source_agent,
+            tool_name="context_injection",
+            args={
+                "query": ctx.query,
+                "top_n": ctx.top_n,
+                "min_score": ctx.min_score,
+                "recall_mode": ctx.mode,
+            },
+            result={
+                "preamble": ctx.preamble,
+                "match_count": ctx.match_count,
+                "matches": ctx.matches_as_records(),
+            },
+            success=True,
+            duration_ms=0,
+            triggered_by=triggered_by,
+        )
 
     def _build_history_messages(self) -> list[dict[str, Any]]:
         """Convert prior Turns into Anthropic-shape user/assistant messages."""
@@ -871,11 +920,48 @@ class ChatSession:
     def _execute_tool(
         self, tu: ToolUse, *, producing_llm_seq: int
     ) -> tuple[int, ToolCall]:
-        """Execute a single tool_use and record an AgentToolCall event."""
+        """Execute a single tool_use and record the AgentToolCall event,
+        bracketed by schema-conformance events (task #7):
+
+          tool_schema_snapshot  (before — freezes the declared contract)
+          <tool_call>           (the execution itself)
+          tool_validation       (after — did the call honour the contract?)
+
+        The snapshot + the tool_call are siblings under `producing_llm_seq`;
+        the validation chains from the tool_call it judges. Replaying an old
+        journal can compare the snapshot's schema_hash against the tool's
+        current schema to detect contract drift.
+        """
+        from korgchat.schema import schema_hash, validate_input
+
+        # 1. Resolve the tool + snapshot its declared schema BEFORE running.
+        #    An unknown tool has no contract to snapshot — we skip the
+        #    snapshot but still validate (it'll be flagged invalid/unknown).
+        tool = self.tools.get(tu.name) if tu.name in self.tools else None
+        declared_schema = tool.input_schema if tool is not None else None
+        s_hash = schema_hash(declared_schema) if declared_schema is not None else None
+
+        if tool is not None:
+            self._bridge.record_tool_call(
+                source_agent=self.source_agent,
+                tool_name="tool_schema_snapshot",
+                args={"tool_name": tu.name},
+                result={
+                    "input_schema": declared_schema,
+                    "description": tool.description,
+                    "schema_hash": s_hash,
+                },
+                success=True,
+                duration_ms=0,
+                triggered_by=producing_llm_seq,
+            )
+
+        # 2. Execute the tool.
         start = time.monotonic()
         success = True
         try:
-            tool = self.tools.get(tu.name)
+            if tool is None:
+                raise KeyError(tu.name)
             result_obj: Any = tool.call(tu.input)
         except KeyError:
             result_obj = {"error": f"unknown tool: {tu.name!r}"}
@@ -885,6 +971,7 @@ class ChatSession:
             success = False
         duration_ms = int((time.monotonic() - start) * 1000)
 
+        # 3. Record the tool_call itself.
         seq = self._bridge.record_tool_call(
             source_agent=self.source_agent,
             tool_name=tu.name,
@@ -894,6 +981,36 @@ class ChatSession:
             duration_ms=duration_ms,
             triggered_by=producing_llm_seq,
         )
+
+        # 4. Validate the call against the declared schema and record the
+        #    verdict, chained to the tool_call it judges.
+        if declared_schema is not None:
+            vres = validate_input(declared_schema, tu.input)
+            val_result: dict[str, Any] = {
+                "schema_known": True,
+                "schema_hash": s_hash,
+                "valid": vres.valid,
+                "violations": vres.violations,
+                "call_succeeded": success,
+            }
+        else:
+            val_result = {
+                "schema_known": False,
+                "schema_hash": None,
+                "valid": False,
+                "violations": [f"no declared schema for tool {tu.name!r}"],
+                "call_succeeded": success,
+            }
+        self._bridge.record_tool_call(
+            source_agent=self.source_agent,
+            tool_name="tool_validation",
+            args={"tool_name": tu.name, "validates_seq": seq},
+            result=val_result,
+            success=val_result["valid"],
+            duration_ms=0,
+            triggered_by=seq,
+        )
+
         call = ToolCall(
             seq=seq,
             name=tu.name,

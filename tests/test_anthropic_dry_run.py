@@ -287,12 +287,20 @@ def test_anthropic_tool_use_round_trip(tmp_journal):
     with patch("anthropic.Anthropic", return_value=fake_client):
         turn = s.send("compute 1+2")
 
-    # 4 journal events: user_prompt, llm_inference(round1), add tool, llm_inference(terminal)
+    # 6 journal events: the add tool call is now bracketed by a
+    # tool_schema_snapshot (before) and a tool_validation (after) — task #7.
     with tmp_journal.open() as f:
         events = json.load(f)
-    assert len(events) == 4
+    assert len(events) == 6
     names = [e["event"]["tool_name"] for e in events]
-    assert names == ["user_prompt", "llm_inference", "add", "llm_inference"]
+    assert names == [
+        "user_prompt",
+        "llm_inference",
+        "tool_schema_snapshot",
+        "add",
+        "tool_validation",
+        "llm_inference",
+    ]
     assert turn.assistant_text == "the answer is 3"
     assert len(turn.tool_calls) == 1
     assert turn.tool_calls[0].name == "add"

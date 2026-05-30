@@ -113,11 +113,13 @@ def _scripted_one_tool() -> MockResponder:
     )
 
 
-def test_single_tool_use_records_four_events(tmp_journal):
+def test_single_tool_use_records_six_events(tmp_journal):
     """LLM requests one tool; KorgChat executes it; LLM produces final text.
 
-    Journal should have: user_prompt, llm_inference (round 1), add tool_call,
-    llm_inference (round 2 / terminal) — 4 events.
+    Since task #7 every tool execution is bracketed by schema-conformance
+    events, so the journal now has 6 events:
+      user_prompt, llm_inference (round 1), tool_schema_snapshot, add
+      tool_call, tool_validation, llm_inference (round 2 / terminal).
     """
     s = ChatSession(journal_path=tmp_journal, responder=_scripted_one_tool())
     turn = s.send("add 2 and 3")
@@ -126,24 +128,30 @@ def test_single_tool_use_records_four_events(tmp_journal):
     assert [e["event"]["tool_name"] for e in events] == [
         "user_prompt",
         "llm_inference",
+        "tool_schema_snapshot",
         "add",
+        "tool_validation",
         "llm_inference",
     ]
-    assert [e["seq_id"] for e in events] == [1, 2, 3, 4]
+    assert [e["seq_id"] for e in events] == [1, 2, 3, 4, 5, 6]
 
-    # Causal chain per §2a:
-    #   1 user_prompt  (root)
-    #   2 llm round-1   triggered_by=1
-    #   3 add tool      triggered_by=2  (sibling under round-1 LLM)
-    #   4 llm round-2   triggered_by=2  (NOT 3 — §2a says chain to prior LLM)
+    # Causal chain per §2a + task #7:
+    #   1 user_prompt          (root)
+    #   2 llm round-1           triggered_by=1
+    #   3 tool_schema_snapshot  triggered_by=2  (sibling under round-1 LLM)
+    #   4 add tool              triggered_by=2  (sibling under round-1 LLM)
+    #   5 tool_validation       triggered_by=4  (judges the add call)
+    #   6 llm round-2           triggered_by=2  (NOT 4 — §2a: chain to prior LLM)
     assert events[0]["metadata"]["triggered_by"] is None
     assert events[1]["metadata"]["triggered_by"] == 1
-    assert events[2]["metadata"]["triggered_by"] == 2
-    assert events[3]["metadata"]["triggered_by"] == 2
+    assert events[2]["metadata"]["triggered_by"] == 2  # snapshot ← round-1 LLM
+    assert events[3]["metadata"]["triggered_by"] == 2  # add ← round-1 LLM
+    assert events[4]["metadata"]["triggered_by"] == 4  # validation ← add call
+    assert events[5]["metadata"]["triggered_by"] == 2  # llm round-2 ← round-1 LLM
 
     # Turn surface
     assert turn.user_seq == 1
-    assert turn.assistant_seq == 4
+    assert turn.assistant_seq == 6
     assert turn.assistant_text == "2 + 3 = 5"
     assert len(turn.tool_calls) == 1
     call = turn.tool_calls[0]
@@ -151,7 +159,7 @@ def test_single_tool_use_records_four_events(tmp_journal):
     assert call.input == {"a": 2, "b": 3}
     assert call.result == {"sum": 5}
     assert call.success is True
-    assert call.seq == 3
+    assert call.seq == 4
 
 
 def test_parallel_tools_share_producing_llm_seq(tmp_journal):
@@ -171,18 +179,28 @@ def test_parallel_tools_share_producing_llm_seq(tmp_journal):
     s = ChatSession(journal_path=tmp_journal, responder=responder)
     turn = s.send("do two things")
     events = _events(tmp_journal)
-    # 5 events: user, llm_r1, add, echo, llm_r2.
+    # 9 events: user, llm_r1, then each tool bracketed by snapshot+validation,
+    # then llm_r2.
     assert [e["event"]["tool_name"] for e in events] == [
-        "user_prompt",
-        "llm_inference",
-        "add",
-        "echo",
-        "llm_inference",
+        "user_prompt",          # 1
+        "llm_inference",        # 2 — round 1
+        "tool_schema_snapshot", # 3 — for add
+        "add",                  # 4
+        "tool_validation",      # 5 — judges add
+        "tool_schema_snapshot", # 6 — for echo
+        "echo",                 # 7
+        "tool_validation",      # 8 — judges echo
+        "llm_inference",        # 9 — round 2
     ]
-    assert events[2]["metadata"]["triggered_by"] == 2  # add ← round-1 LLM
-    assert events[3]["metadata"]["triggered_by"] == 2  # echo ← round-1 LLM (sibling)
-    assert events[4]["metadata"]["triggered_by"] == 2  # llm_r2 ← round-1 LLM (§2a)
-    assert turn.assistant_seq == 5
+    # Both tools (and their snapshots) are siblings under the round-1 LLM.
+    assert events[2]["metadata"]["triggered_by"] == 2  # add snapshot ← round-1 LLM
+    assert events[3]["metadata"]["triggered_by"] == 2  # add ← round-1 LLM
+    assert events[4]["metadata"]["triggered_by"] == 4  # add validation ← add call
+    assert events[5]["metadata"]["triggered_by"] == 2  # echo snapshot ← round-1 LLM
+    assert events[6]["metadata"]["triggered_by"] == 2  # echo ← round-1 LLM (sibling)
+    assert events[7]["metadata"]["triggered_by"] == 7  # echo validation ← echo call
+    assert events[8]["metadata"]["triggered_by"] == 2  # llm_r2 ← round-1 LLM (§2a)
+    assert turn.assistant_seq == 9
     assert len(turn.tool_calls) == 2
     assert {c.name for c in turn.tool_calls} == {"add", "echo"}
 
@@ -200,17 +218,21 @@ def test_multi_round_tool_use(tmp_journal):
     turn = s.send("add 10 and 20 then echo")
     events = _events(tmp_journal)
     assert [e["event"]["tool_name"] for e in events] == [
-        "user_prompt",      # 1
-        "llm_inference",    # 2 — round 1
-        "add",              # 3 — under llm 2
-        "llm_inference",    # 4 — round 2, chains to 2 per §2a
-        "echo",             # 5 — under llm 4
-        "llm_inference",    # 6 — round 3 / terminal, chains to 4 per §2a
+        "user_prompt",          # 1
+        "llm_inference",        # 2 — round 1
+        "tool_schema_snapshot", # 3 — for add, under llm 2
+        "add",                  # 4 — under llm 2
+        "tool_validation",      # 5 — judges add
+        "llm_inference",        # 6 — round 2, chains to 2 per §2a
+        "tool_schema_snapshot", # 7 — for echo, under llm 6
+        "echo",                 # 8 — under llm 6
+        "tool_validation",      # 9 — judges echo
+        "llm_inference",        # 10 — round 3 / terminal, chains to 6 per §2a
     ]
     chain = [e["metadata"]["triggered_by"] for e in events]
-    assert chain == [None, 1, 2, 2, 4, 4]
+    assert chain == [None, 1, 2, 2, 4, 2, 6, 6, 8, 6]
     assert turn.assistant_text == "answer: 30"
-    assert turn.assistant_seq == 6
+    assert turn.assistant_seq == 10
     assert [c.name for c in turn.tool_calls] == ["add", "echo"]
 
 
@@ -249,7 +271,14 @@ def test_tool_handler_exception_recorded_as_error(tmp_journal):
     assert turn.tool_calls[0].success is False
     assert "error" in turn.tool_calls[0].result
     events = _events(tmp_journal)
-    assert events[2]["event"]["success"] is False
+    # Select the add tool_call by name (its index shifted now that schema
+    # snapshot/validation events bracket it).
+    add_event = next(e for e in events if e["event"]["tool_name"] == "add")
+    assert add_event["event"]["success"] is False
+    # The validation event flags the missing-required-field violation too.
+    val = next(e for e in events if e["event"]["tool_name"] == "tool_validation")
+    assert val["event"]["result"]["valid"] is False
+    assert val["event"]["result"]["call_succeeded"] is False
 
 
 def test_max_iterations_blocks_runaway(tmp_journal):
@@ -272,13 +301,15 @@ def test_free_mode_tool_marker(tmp_journal):
     """Free-mode MockResponder recognises [tool:name(args)] markers in the prompt."""
     s = ChatSession(journal_path=tmp_journal, responder=MockResponder())
     turn = s.send("please [tool:add(a=4, b=6)] for me")
-    # Marker should be picked up and round-tripped through the loop:
-    # user_prompt, llm_round1 (requesting add), add tool, llm_round2 (terminal).
+    # Marker should be picked up and round-tripped through the loop, with the
+    # add call bracketed by schema snapshot + validation (task #7):
     events = _events(tmp_journal)
     assert [e["event"]["tool_name"] for e in events] == [
         "user_prompt",
         "llm_inference",
+        "tool_schema_snapshot",
         "add",
+        "tool_validation",
         "llm_inference",
     ]
     assert turn.tool_calls[0].result == {"sum": 10}
@@ -430,7 +461,10 @@ def test_cli_tool_marker_run(tmp_journal, monkeypatch, capsys):
     assert [e["event"]["tool_name"] for e in events] == [
         "user_prompt",
         "llm_inference",
+        "tool_schema_snapshot",
         "add",
+        "tool_validation",
         "llm_inference",
     ]
-    assert events[2]["event"]["result"] == {"sum": 15}
+    add_event = next(e for e in events if e["event"]["tool_name"] == "add")
+    assert add_event["event"]["result"] == {"sum": 15}

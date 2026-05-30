@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Auto-context injection is now a first-class ledger event.** Previously the recall-augmented preamble the model actually saw was a *ghost* — the journal recorded only the user's original prompt. Now, whenever auto-context injects a preamble, a `context_injection` event is written capturing the preamble text, the recall query, and the matched `seq_id`s + scores, causally chained `user_prompt → context_injection → llm_inference`. The user_prompt event still records only what the user typed; the injected context is a separate, auditable, replayable event. New `AutoContextEngine.build_context()` returns a `ContextInjection` (preamble + structured matches); `build_preamble()` is now a thin wrapper over it.
+- **Tool-schema snapshot + conformance events.** Every tool execution is now bracketed by two events: a `tool_schema_snapshot` *before* the call (the declared `input_schema`, `description`, and a deterministic `schema_hash`) and a `tool_validation` *after* (did the call's input conform to the declared schema? did the call succeed?). A replayed conversation stays meaningful even after a tool's schema changes — the contract it ran against is frozen on the ledger, and a stale call is detectable. New `korgchat.schema` module: `schema_hash()` (canonical sha256, byte-for-byte aligned with `korg-ledger@v1` canonicalization) and a dependency-free `validate_input()`.
+
 ### Changed
+- `_render_event_line` in `/summarize` renders `context_injection`, `tool_schema_snapshot`, and `tool_validation` as distinct meta-event lines so digests don't miscount them as user-invoked tool calls.
 - `.gitignore` extended for transient HTML artifacts.
 
 ## [0.5.3] — 2026-05-27
