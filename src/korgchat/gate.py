@@ -30,6 +30,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Protocol
 
+from .ontology import CategoryOntology
 from .tools import Tool
 
 # goldseel on Modal (serverless, native shape: {intent, mandate_summary, redemption} -> {verdict, reasoning}).
@@ -75,12 +76,25 @@ class GoldseelGate:
 
 
 def payment_mandate(
-    intent: str, spend_cap_usd: float, *, recipient_policy: Any = None
+    intent: str,
+    spend_cap_usd: float,
+    *,
+    allow_classes: list[str] | None = None,
+    deny_classes: list[str] | None = None,
+    recipient_policy: Any = None,
 ) -> dict[str, Any]:
-    """Build a payment mandate: the human-authorized intent + a spend cap."""
+    """Build a payment mandate.
+
+    ``allow_classes`` / ``deny_classes`` are ontology category classes (e.g.
+    ``["ai-compute"]`` / ``["prohibited"]``) used by the deterministic floor.
+    ``deny_classes`` defaults to ``["prohibited"]``. ``intent`` is the free-text
+    purpose used by goldseel for recipients the ontology can't resolve.
+    """
     return {
         "intent": intent,
         "spend_cap_usd": float(spend_cap_usd),
+        "allow_classes": list(allow_classes) if allow_classes else [],
+        "deny_classes": list(deny_classes) if deny_classes is not None else ["prohibited"],
         "recipient_policy": recipient_policy,
     }
 
@@ -95,15 +109,22 @@ def goldseel_pay_tool(
     mandate: dict[str, Any],
     *,
     gate: Gate | None = None,
+    ontology: CategoryOntology | None = None,
+    learn: bool = True,
     name: str = "pay",
     simulate: bool = True,
 ) -> Tool:
-    """A ``pay`` :class:`~korgchat.tools.Tool` gated by goldseel.
+    """A ``pay`` :class:`~korgchat.tools.Tool` gated by the ontology + goldseel.
 
-    ``mandate`` is a :func:`payment_mandate`. The tool tracks remaining cap
+    ``mandate`` is a :func:`payment_mandate`. The deterministic category
+    ontology resolves known recipients (ALLOW/DENY) without a model call; only
+    genuine unknowns reach goldseel. With ``learn=True`` newly-classified
+    recipients are written back to the ontology so future calls resolve
+    deterministically — the system compounds. The tool tracks remaining cap
     across calls within the session.
     """
     judge: Gate = gate or GoldseelGate()
+    ont: CategoryOntology = ontology or CategoryOntology()
     mandate_hash = _mandate_hash(mandate)
     state = {"remaining": float(mandate["spend_cap_usd"])}
 
@@ -114,36 +135,56 @@ def goldseel_pay_tool(
         amount = float(amount)
         recipient = args.get("recipient_name") or args.get("recipient_domain") or "unknown"
 
+        redemption = {
+            "recipient_domain": args.get("recipient_domain"),
+            "recipient_name": args.get("recipient_name"),
+            "recipient_categories": args.get("recipient_categories"),
+            "vendor_known": bool(args.get("recipient_name") or args.get("recipient_domain")),
+            "amount_usdc": int(round(amount * 1e6)),
+            "resource_description": args.get("resource_description"),
+        }
+
         reasons: list[str] = []
-        # deterministic floor: never exceed the signed cap
+        decided_by = None
+        floor = {"floor": "SKIPPED", "categories": []}
+        verdict = {"verdict": "skip", "reasoning": "not evaluated"}
+        escalate = False
+
+        # 1. deterministic spend-cap floor
         if amount > state["remaining"]:
             reasons.append(
                 f"amount ${amount:.2f} exceeds remaining mandate cap ${state['remaining']:.2f}"
             )
+            decided_by = "deterministic-cap"
 
-        # Consult goldseel only if the deterministic floor passed — the owned
-        # model is pay-per-call, so don't spend a call on an already-doomed pay.
-        verdict = {"verdict": "skip", "reasoning": "not evaluated (deterministic reject)"}
-        escalate = False
+        # 2. ontology floor — known recipients resolve without a model call
         if not reasons:
-            mandate_summary = {
-                "spend_cap_remaining": state["remaining"],
-                "use_counter_remaining": None,
-                "expiry": None,
-                "recipient_policy": mandate.get("recipient_policy"),
-            }
-            redemption = {
-                "recipient_domain": args.get("recipient_domain"),
-                "recipient_name": args.get("recipient_name"),
-                "recipient_categories": args.get("recipient_categories"),
-                "vendor_known": bool(args.get("recipient_name") or args.get("recipient_domain")),
-                "amount_usdc": int(round(amount * 1e6)),
-                "resource_description": args.get("resource_description"),
-            }
-            verdict = judge.evaluate(mandate["intent"], mandate_summary, redemption)
-            if verdict["verdict"] == "reject":
-                reasons.append(f"goldseel: {verdict['reasoning']}")
-            escalate = verdict["verdict"] == "skip"  # owned model down -> defer to a human
+            floor = ont.resolve(
+                redemption, allow=mandate.get("allow_classes"), deny=mandate.get("deny_classes")
+            )
+            if floor["floor"] == "DENY":
+                reasons.append(f"ontology: {floor['reasons'][0]}")
+                decided_by = "ontology"
+            elif floor["floor"] == "ALLOW":
+                decided_by = "ontology"  # deterministic accept — goldseel not consulted
+            else:
+                # 3. genuine unknown -> consult the owned model (pay-per-call)
+                mandate_summary = {
+                    "spend_cap_remaining": state["remaining"],
+                    "use_counter_remaining": None,
+                    "expiry": None,
+                    "recipient_policy": mandate.get("recipient_policy"),
+                }
+                verdict = judge.evaluate(mandate["intent"], mandate_summary, redemption)
+                decided_by = "goldseel"
+                if verdict["verdict"] == "reject":
+                    reasons.append(f"goldseel: {verdict['reasoning']}")
+                escalate = verdict["verdict"] == "skip"  # model down -> defer to a human
+
+        # compounding: cache any explicit classification so the next call is deterministic
+        learned_key = None
+        if learn and redemption.get("recipient_categories"):
+            learned_key = ont.learn(redemption, redemption["recipient_categories"])
 
         decision = "REJECT" if reasons else ("ESCALATE" if escalate else "ACCEPT")
         settled = False
@@ -155,10 +196,15 @@ def goldseel_pay_tool(
             "decision": decision,
             "amount_usd": amount,
             "recipient": recipient,
+            "decided_by": decided_by,
+            "floor": floor["floor"],
+            "categories": floor.get("categories", []),
             "reasons": reasons,
             "goldseel": verdict,
             "remaining_after": round(state["remaining"], 6),
             "mandate_hash": mandate_hash,
+            "learned": learned_key,
+            "vendors_known": ont.stats()["vendors_known"],
             "settled": settled,
             "settlement": "simulated" if settled else None,
         }

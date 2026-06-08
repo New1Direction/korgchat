@@ -55,10 +55,10 @@ def test_remaining_cap_decrements_across_calls():
 
 def test_reject_when_goldseel_rejects():
     tool, _ = _tool("reject")
-    r = tool.call(
-        {"amount_usd": 10, "recipient_name": "Bet365", "recipient_categories": ["gambling"]}
-    )
+    # an UNKNOWN recipient (no ontology match) actually reaches the model
+    r = tool.call({"amount_usd": 10, "recipient_domain": "unknownshop.io"})
     assert r["decision"] == "REJECT"
+    assert r["decided_by"] == "goldseel"
     assert r["settled"] is False
     assert any("goldseel" in x for x in r["reasons"])
 
@@ -112,6 +112,54 @@ def test_pay_decision_is_recorded_in_the_ledger(tmp_path):
     assert result["decision"] == "ACCEPT"
     assert result["mandate_hash"]
     assert result["goldseel"]["verdict"] == "approve"
+
+
+def _ont_tool(verdict, cap=100.0):
+    gate = FakeGate(verdict)
+    mandate = payment_mandate(INTENT, cap, allow_classes=["ai-compute"], deny_classes=["prohibited"])
+    return goldseel_pay_tool(mandate, gate=gate), gate
+
+
+def test_ontology_allow_bypasses_the_model():
+    # the model would (wrongly) reject — but a known-good recipient never reaches it
+    tool, gate = _ont_tool("reject")
+    r = tool.call(
+        {"amount_usd": 12, "recipient_domain": "api.openai.com", "recipient_categories": ["ml-inference"]}
+    )
+    assert r["decision"] == "ACCEPT"
+    assert r["decided_by"] == "ontology"
+    assert r["floor"] == "ALLOW"
+    assert gate.calls == []  # false-reject is structurally impossible here
+
+
+def test_ontology_deny_bypasses_the_model():
+    # the model would (wrongly) approve — but a prohibited recipient is blocked first
+    tool, gate = _ont_tool("approve")
+    r = tool.call(
+        {"amount_usd": 10, "recipient_domain": "bet365.com", "recipient_categories": ["gambling"]}
+    )
+    assert r["decision"] == "REJECT"
+    assert r["decided_by"] == "ontology"
+    assert r["floor"] == "DENY"
+    assert gate.calls == []
+
+
+def test_unknown_recipient_consults_the_model():
+    tool, gate = _ont_tool("approve")
+    r = tool.call({"amount_usd": 5, "recipient_domain": "mystery.io"})
+    assert r["decided_by"] == "goldseel"
+    assert len(gate.calls) == 1
+
+
+def test_compounding_learns_a_new_vendor():
+    tool, gate = _ont_tool("approve")
+    r1 = tool.call({"amount_usd": 5, "recipient_domain": "newgpu.io", "recipient_categories": ["gpu-compute"]})
+    assert r1["decided_by"] == "ontology"
+    assert r1["learned"] == "newgpu.io"
+    # second call has NO explicit category — resolved from the learned registry
+    r2 = tool.call({"amount_usd": 5, "recipient_domain": "newgpu.io"})
+    assert r2["decided_by"] == "ontology"
+    assert gate.calls == []  # the model was never needed
 
 
 @pytest.mark.skipif(

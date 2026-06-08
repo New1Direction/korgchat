@@ -132,6 +132,32 @@ The decision, the goldseel verdict, and the mandate hash are recorded to the
 ledger — so *what an agent was allowed to spend, and why,* is provable. The
 gate is model-agnostic: point `GOLDSEEL_URL` at any goldseel deployment.
 
+### Knowledge floor (ontology) — and how it compounds
+
+Before goldseel is consulted, the `pay` tool resolves the recipient against a
+**category ontology** (`korgchat.ontology`): a controlled vocabulary with
+synonyms and an is-a hierarchy (`ml-inference` ≡ `ai-inference` ≡
+`llm-inference`, all *is-a* `ai-compute`; `gambling`/`adult`/`crypto-trading`
+*is-a* `prohibited`) plus a vendor registry. **Known recipients resolve
+deterministically** — ALLOW/DENY with no model call — so `ml-inference ≠
+ai-inference` mistakes are impossible, and the model is only spent on genuine
+unknowns.
+
+It **compounds**: every newly-classified recipient is learned back into the
+registry (`learn()`, optionally persisted), so the known set grows
+monotonically — the more decisions the system makes, the fewer reach the model
+and the more consistent it gets (a data network effect). Each `pay` result
+records `decided_by` (`ontology` vs `goldseel`) so the audit shows *which*
+layer decided.
+
+```python
+from korgchat.gate import payment_mandate, goldseel_pay_tool
+tool = goldseel_pay_tool(payment_mandate(
+    "Pay only for AI inference / GPU compute. No gambling.",
+    spend_cap_usd=50, allow_classes=["ai-compute"], deny_classes=["prohibited"],
+))
+```
+
 ## Streaming (v0.4.2)
 
 By default, every assistant text reply streams to stdout character-by-character
