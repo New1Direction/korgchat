@@ -30,6 +30,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Protocol
 
+from .escalation import EscalationLog
 from .ontology import CategoryOntology
 from .tools import Tool
 
@@ -71,7 +72,14 @@ class GoldseelGate:
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
             return {"verdict": "skip", "reasoning": f"goldseel unreachable: {e}"}
         verdict = str(data.get("verdict", "")).lower()
-        normalized = "approve" if "approve" in verdict else "reject" if "reject" in verdict else "skip"
+        if "escalate" in verdict:
+            normalized = "escalate"
+        elif "approve" in verdict:
+            normalized = "approve"
+        elif "reject" in verdict:
+            normalized = "reject"
+        else:
+            normalized = "skip"
         return {"verdict": normalized, "reasoning": str(data.get("reasoning", ""))}
 
 
@@ -110,6 +118,7 @@ def goldseel_pay_tool(
     *,
     gate: Gate | None = None,
     ontology: CategoryOntology | None = None,
+    escalation_log: EscalationLog | None = None,
     learn: bool = True,
     name: str = "pay",
     simulate: bool = True,
@@ -143,6 +152,9 @@ def goldseel_pay_tool(
             "amount_usdc": int(round(amount * 1e6)),
             "resource_description": args.get("resource_description"),
         }
+        # the dollar-denominated view goldseel was trained on
+        gs_redemption = {**redemption, "amount_usdc": f"{amount:.2f}"}
+        gs_summary: dict[str, Any] | None = None
 
         reasons: list[str] = []
         decided_by = None
@@ -171,7 +183,7 @@ def goldseel_pay_tool(
                 # 3. genuine unknown -> consult the owned model (pay-per-call).
                 # goldseel was trained on DOLLAR-denominated amounts (e.g. "12.00"),
                 # NOT on-chain micros — send the dollar view so it reads the cap right.
-                mandate_summary = {
+                gs_summary = {
                     # match goldseel's training distribution: dollar cap, a POSITIVE
                     # use-counter (None reads as "exhausted -> reject"), no expiry.
                     "spend_cap_remaining": f"{state['remaining']:.2f} USDC",
@@ -179,12 +191,12 @@ def goldseel_pay_tool(
                     "expiry_iso": None,
                     "recipient_policy": mandate.get("recipient_policy") or "any",
                 }
-                gs_redemption = {**redemption, "amount_usdc": f"{amount:.2f}"}
-                verdict = judge.evaluate(mandate["intent"], mandate_summary, gs_redemption)
+                verdict = judge.evaluate(mandate["intent"], gs_summary, gs_redemption)
                 decided_by = "goldseel"
                 if verdict["verdict"] == "reject":
                     reasons.append(f"goldseel: {verdict['reasoning']}")
-                escalate = verdict["verdict"] == "skip"  # model down -> defer to a human
+                # model defers OR is unreachable -> defer to a human
+                escalate = verdict["verdict"] in ("escalate", "skip")
 
         # compounding: cache any explicit classification so the next call is deterministic
         learned_key = None
@@ -196,6 +208,19 @@ def goldseel_pay_tool(
         if decision == "ACCEPT":
             state["remaining"] -= amount
             settled = simulate
+
+        # harvest: log escalations so a human's later resolution becomes training data
+        escalation_id = None
+        if decision == "ESCALATE" and escalation_log is not None:
+            escalation_id = escalation_log.record(
+                intent=mandate["intent"],
+                mandate_summary=gs_summary or {},
+                redemption=gs_redemption,
+                reason=verdict.get("reasoning") or "goldseel deferred or unreachable",
+                amount_usd=amount,
+                recipient=recipient,
+                mandate_hash=mandate_hash,
+            )
 
         return {
             "decision": decision,
@@ -210,6 +235,7 @@ def goldseel_pay_tool(
             "mandate_hash": mandate_hash,
             "learned": learned_key,
             "vendors_known": ont.stats()["vendors_known"],
+            "escalation_id": escalation_id,
             "settled": settled,
             "settlement": "simulated" if settled else None,
         }
