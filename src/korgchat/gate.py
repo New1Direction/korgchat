@@ -168,14 +168,19 @@ def goldseel_pay_tool(
             elif floor["floor"] == "ALLOW":
                 decided_by = "ontology"  # deterministic accept — goldseel not consulted
             else:
-                # 3. genuine unknown -> consult the owned model (pay-per-call)
+                # 3. genuine unknown -> consult the owned model (pay-per-call).
+                # goldseel was trained on DOLLAR-denominated amounts (e.g. "12.00"),
+                # NOT on-chain micros — send the dollar view so it reads the cap right.
                 mandate_summary = {
-                    "spend_cap_remaining": state["remaining"],
-                    "use_counter_remaining": None,
-                    "expiry": None,
-                    "recipient_policy": mandate.get("recipient_policy"),
+                    # match goldseel's training distribution: dollar cap, a POSITIVE
+                    # use-counter (None reads as "exhausted -> reject"), no expiry.
+                    "spend_cap_remaining": f"{state['remaining']:.2f} USDC",
+                    "use_counter_remaining": 999,
+                    "expiry_iso": None,
+                    "recipient_policy": mandate.get("recipient_policy") or "any",
                 }
-                verdict = judge.evaluate(mandate["intent"], mandate_summary, redemption)
+                gs_redemption = {**redemption, "amount_usdc": f"{amount:.2f}"}
+                verdict = judge.evaluate(mandate["intent"], mandate_summary, gs_redemption)
                 decided_by = "goldseel"
                 if verdict["verdict"] == "reject":
                     reasons.append(f"goldseel: {verdict['reasoning']}")

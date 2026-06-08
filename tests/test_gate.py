@@ -42,7 +42,7 @@ def test_accept_within_cap_and_approved():
     assert r["remaining_after"] == 38.0
     assert r["mandate_hash"]
     assert len(gate.calls) == 1
-    assert gate.calls[0][1]["spend_cap_remaining"] == 50.0  # goldseel saw the right cap
+    assert gate.calls[0][1]["spend_cap_remaining"] == "50.00 USDC"  # dollar-formatted for goldseel
 
 
 def test_remaining_cap_decrements_across_calls():
