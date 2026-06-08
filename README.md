@@ -59,7 +59,33 @@ korgchat --mock --no-stream
 # Tune mock-mode streaming speed (default 0.005s/char):
 korgchat --mock --stream-delay 0.05      # slow & visible
 korgchat --mock --stream-delay 0         # instant
+
+# Give the agent a sandboxed `bash` tool (verifiable exec):
+cd sandbox && npm install && cd ..       # one-time: pulls just-bash
+korgchat --sandbox
 ```
+
+## Sandboxed shell (`--sandbox`)
+
+`--sandbox` adds a `bash` tool backed by
+[just-bash](https://github.com/vercel-labs/just-bash) — a JS reimplementation
+of bash + ~90 coreutils over an **in-memory** filesystem, run as a persistent
+Node sidecar (`sandbox/sidecar.mjs`). The shell physically cannot reach the
+host filesystem or network (no network/python/js are enabled).
+
+Every command returns `fs_hash` — a hash of the full virtual-filesystem state
+after it runs. Because each tool call is hash-chained into the ledger, the
+agent's shell session becomes **tamper-evident and replayable**: the same
+commands from a fresh sandbox reproduce the same hashes.
+
+```python
+from korgchat import ChatSession
+from korgchat.sandbox import tools_with_sandbox
+
+session = ChatSession(journal_path=..., responder=..., tools=tools_with_sandbox())
+```
+
+Requires Node ≥18 and a one-time `npm install` in `sandbox/`.
 
 ## Streaming (v0.4.2)
 

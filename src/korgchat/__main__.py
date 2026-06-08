@@ -13,6 +13,7 @@ from pathlib import Path
 from korgchat import __version__
 from korgchat.chat import ChatSession, MockResponder, ToolCall, select_responder
 from korgchat.recall import RecallEngine, format_matches
+from korgchat.sandbox import SandboxClient, SandboxError, tools_with_sandbox
 from korgchat.summary import SummarizeEngine
 
 
@@ -69,6 +70,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.005,
         help="(--mock only) Delay between simulated tokens, seconds. Default "
              "0.005 gives a visible streaming effect; set to 0 for instant output.",
+    )
+    p.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="Add a sandboxed `bash` tool backed by just-bash (in-memory "
+             "filesystem, no host or network access). Requires Node and "
+             "`npm install` in sandbox/. Every command and the resulting "
+             "filesystem hash are recorded to the ledger for verifiable replay.",
     )
     return p
 
@@ -512,13 +521,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.mock and streaming and args.stream_delay > 0:
         responder = MockResponder(stream_delay_secs=args.stream_delay)
 
-    session = ChatSession(
+    sandbox_client: SandboxClient | None = None
+    session_kwargs: dict = dict(
         journal_path=Path(args.journal),
         responder=responder,
         auto_context=args.auto_context,
     )
+    if args.sandbox:
+        try:
+            sandbox_client = SandboxClient()
+            sandbox_client.ping()
+        except SandboxError as e:
+            print(f"[korgchat] --sandbox unavailable: {e}", file=sys.stderr)
+            return 2
+        session_kwargs["tools"] = tools_with_sandbox(client=sandbox_client)
+
+    session = ChatSession(**session_kwargs)
     _print_banner(session, mock=args.mock, streaming=streaming)
-    return _interactive_loop(session, args.turns, streaming=streaming)
+    try:
+        return _interactive_loop(session, args.turns, streaming=streaming)
+    finally:
+        if sandbox_client is not None:
+            sandbox_client.close()
 
 
 if __name__ == "__main__":
