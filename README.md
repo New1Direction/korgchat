@@ -104,6 +104,34 @@ tools = tools_with_sandbox(mandate=shell_mandate(["ls", "cat", "grep"], deny=["r
 
 Requires Node ≥18 and a one-time `npm install` in `sandbox/`.
 
+## Payments (goldseel-gated)
+
+The `pay` tool (`korgchat.gate`) authorizes a payment through **goldseel**, an
+owned mandate-enforcement model served on Modal. A deterministic spend-cap runs
+first; goldseel then judges the payment against the authorized intent. The
+outcome is three-way:
+
+- **ACCEPT** — within cap and goldseel approved
+- **REJECT** — over cap, or goldseel rejected
+- **ESCALATE** — goldseel unreachable → defer to a human (never auto-approved)
+
+```python
+from korgchat import ChatSession
+from korgchat.gate import goldseel_pay_tool, payment_mandate
+from korgchat.tools import default_tools
+
+tools = default_tools()
+tools.register(goldseel_pay_tool(payment_mandate(
+    "Pay only for AI inference / GPU compute. No gambling, adult, or crypto-trading.",
+    spend_cap_usd=50,
+)))
+session = ChatSession(journal_path=..., responder=..., tools=tools)
+```
+
+The decision, the goldseel verdict, and the mandate hash are recorded to the
+ledger — so *what an agent was allowed to spend, and why,* is provable. The
+gate is model-agnostic: point `GOLDSEEL_URL` at any goldseel deployment.
+
 ## Streaming (v0.4.2)
 
 By default, every assistant text reply streams to stdout character-by-character
