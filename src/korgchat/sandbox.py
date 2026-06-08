@@ -55,10 +55,12 @@ class SandboxClient:
         node: str | None = None,
         sidecar: Path | None = None,
         default_timeout_ms: int = DEFAULT_TIMEOUT_MS,
+        mandate: dict[str, Any] | None = None,
     ) -> None:
         self._node = node or shutil.which("node")
         self._sidecar = Path(sidecar) if sidecar else _SIDECAR
         self._default_timeout_ms = default_timeout_ms
+        self._mandate = mandate
         self._proc: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
         self._id = 0
@@ -84,23 +86,34 @@ class SandboxClient:
             text=True,
             bufsize=1,
         )
+        # Apply the mandate to the fresh process before any exec (lock already held).
+        if self._mandate is not None:
+            self._id += 1
+            self._send_recv(
+                {"id": self._id, "op": "configure", "mandate": self._mandate}, self._proc
+            )
         return self._proc
+
+    def _send_recv(
+        self, payload: dict[str, Any], proc: subprocess.Popen[str]
+    ) -> dict[str, Any]:
+        """Write one request + read one response line. Caller holds the lock."""
+        assert proc.stdin is not None and proc.stdout is not None
+        try:
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+        except (BrokenPipeError, ValueError) as e:  # pragma: no cover - process died
+            raise SandboxError(f"sandbox sidecar communication failed: {e}") from e
+        if not line:
+            raise SandboxError("sandbox sidecar closed unexpectedly")
+        return json.loads(line)
 
     def _rpc(self, req: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             proc = self._ensure()
-            assert proc.stdin is not None and proc.stdout is not None
             self._id += 1
-            payload = {"id": self._id, **req}
-            try:
-                proc.stdin.write(json.dumps(payload) + "\n")
-                proc.stdin.flush()
-                line = proc.stdout.readline()
-            except (BrokenPipeError, ValueError) as e:  # pragma: no cover - process died
-                raise SandboxError(f"sandbox sidecar communication failed: {e}") from e
-            if not line:
-                raise SandboxError("sandbox sidecar closed unexpectedly")
-            return json.loads(line)
+            return self._send_recv({"id": self._id, **req}, proc)
 
     def ping(self) -> dict[str, Any]:
         return self._rpc({"op": "ping"})
@@ -121,8 +134,18 @@ class SandboxClient:
         return res
 
     def reset(self) -> dict[str, Any]:
-        """Discard the virtual filesystem and start a fresh sandbox."""
+        """Discard the virtual filesystem and start a fresh sandbox (keeps the mandate)."""
         return self._rpc({"op": "reset"})
+
+    def configure(self, mandate: dict[str, Any] | None) -> dict[str, Any]:
+        """Set the command mandate (``{"allow": [...], "deny": [...]}``).
+
+        The allowlist is enforced physically (only those commands are
+        registered in the sandbox) and as a pre-exec verdict. Resets the
+        virtual filesystem.
+        """
+        self._mandate = mandate
+        return self._rpc({"op": "configure", "mandate": mandate})
 
     def close(self) -> None:
         with self._lock:
@@ -168,13 +191,19 @@ def bash_tool(client: SandboxClient | None = None, *, name: str = "bash") -> Too
             command,
             timeout_ms=timeout_ms if isinstance(timeout_ms, int) else None,
         )
-        return {
+        out: dict[str, Any] = {
             "stdout": res.get("stdout", ""),
             "stderr": res.get("stderr", ""),
             "exit_code": res.get("exit_code"),
             "fs_hash": res.get("fs_hash"),
             "fs_files": res.get("fs_files"),
         }
+        # Mandate verdict (present only when a mandate is configured).
+        if "gate" in res:
+            out["gate"] = res["gate"]
+        if res.get("blocked"):
+            out["blocked"] = True
+        return out
 
     return Tool(
         name=name,
@@ -205,10 +234,34 @@ def bash_tool(client: SandboxClient | None = None, *, name: str = "bash") -> Too
     )
 
 
+def shell_mandate(allow: list[str], deny: list[str] | None = None) -> dict[str, Any]:
+    """Build a shell mandate: an allowlist of commands (plus optional denylist).
+
+    The allowlist is the security boundary — only those commands are registered
+    in the sandbox. ``deny`` overrides ``allow`` for finer policy.
+    """
+    mandate: dict[str, Any] = {"allow": list(allow)}
+    if deny:
+        mandate["deny"] = list(deny)
+    return mandate
+
+
 def tools_with_sandbox(
-    *, frozen_time: float | None = None, client: SandboxClient | None = None
+    *,
+    frozen_time: float | None = None,
+    client: SandboxClient | None = None,
+    mandate: dict[str, Any] | None = None,
 ) -> ToolRegistry:
-    """The default builtins plus the sandboxed ``bash`` tool."""
+    """The default builtins plus the sandboxed ``bash`` tool.
+
+    Pass ``mandate`` (e.g. from :func:`shell_mandate`) to gate the shell to an
+    allowlist of commands; the verdict for each call is carried in the tool
+    result and recorded to the ledger.
+    """
+    if client is None:
+        client = SandboxClient(mandate=mandate)
+    elif mandate is not None:
+        client.configure(mandate)
     registry = default_tools(frozen_time=frozen_time)
     registry.register(bash_tool(client))
     return registry

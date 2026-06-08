@@ -85,6 +85,23 @@ from korgchat.sandbox import tools_with_sandbox
 session = ChatSession(journal_path=..., responder=..., tools=tools_with_sandbox())
 ```
 
+**Mandate (`--mandate-allow`).** Constrain the shell to a command allowlist.
+It's enforced two ways — just-bash only registers the allowed commands
+(physical), and each line is parsed before exec so a disallowed or
+dynamically-named command (`$CMD`) is rejected (fail-closed). Every call
+carries a verdict that's recorded to the ledger, so what the agent was
+*allowed* to run is itself provable.
+
+```bash
+korgchat --mandate-allow "ls,cat,grep,sed,awk,find,sort,wc,head,tail,echo"
+```
+
+```python
+from korgchat.sandbox import tools_with_sandbox, shell_mandate
+
+tools = tools_with_sandbox(mandate=shell_mandate(["ls", "cat", "grep"], deny=["rm"]))
+```
+
 Requires Node ≥18 and a one-time `npm install` in `sandbox/`.
 
 ## Streaming (v0.4.2)
