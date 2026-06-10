@@ -2,6 +2,8 @@
 
 The first chat product built on the Korg cognitive ledger.
 
+[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md)
+
 Every turn of a KorgChat conversation is recorded as an `AgentToolCall` event
 in the same `.korg/journal.json` that powers korgex's agent loop, the MCP
 session browser, and the Ctrl-R rewind in korg-tui. The conversation is
