@@ -61,6 +61,103 @@ korgchat --mock --no-stream
 # Tune mock-mode streaming speed (default 0.005s/char):
 korgchat --mock --stream-delay 0.05      # slow & visible
 korgchat --mock --stream-delay 0         # instant
+
+# Give the agent a sandboxed `bash` tool (verifiable exec):
+cd sandbox && npm install && cd ..       # one-time: pulls just-bash
+korgchat --sandbox
+```
+
+## Sandboxed shell (`--sandbox`)
+
+`--sandbox` adds a `bash` tool backed by
+[just-bash](https://github.com/vercel-labs/just-bash) — a JS reimplementation
+of bash + ~90 coreutils over an **in-memory** filesystem, run as a persistent
+Node sidecar (`sandbox/sidecar.mjs`). The shell physically cannot reach the
+host filesystem or network (no network/python/js are enabled).
+
+Every command returns `fs_hash` — a hash of the full virtual-filesystem state
+after it runs. Because each tool call is hash-chained into the ledger, the
+agent's shell session becomes **tamper-evident and replayable**: the same
+commands from a fresh sandbox reproduce the same hashes.
+
+```python
+from korgchat import ChatSession
+from korgchat.sandbox import tools_with_sandbox
+
+session = ChatSession(journal_path=..., responder=..., tools=tools_with_sandbox())
+```
+
+**Mandate (`--mandate-allow`).** Constrain the shell to a command allowlist.
+It's enforced two ways — just-bash only registers the allowed commands
+(physical), and each line is parsed before exec so a disallowed or
+dynamically-named command (`$CMD`) is rejected (fail-closed). Every call
+carries a verdict that's recorded to the ledger, so what the agent was
+*allowed* to run is itself provable.
+
+```bash
+korgchat --mandate-allow "ls,cat,grep,sed,awk,find,sort,wc,head,tail,echo"
+```
+
+```python
+from korgchat.sandbox import tools_with_sandbox, shell_mandate
+
+tools = tools_with_sandbox(mandate=shell_mandate(["ls", "cat", "grep"], deny=["rm"]))
+```
+
+Requires Node ≥18 and a one-time `npm install` in `sandbox/`.
+
+## Payments (goldseel-gated)
+
+The `pay` tool (`korgchat.gate`) authorizes a payment through **goldseel**, an
+owned mandate-enforcement model served on Modal. A deterministic spend-cap runs
+first; goldseel then judges the payment against the authorized intent. The
+outcome is three-way:
+
+- **ACCEPT** — within cap and goldseel approved
+- **REJECT** — over cap, or goldseel rejected
+- **ESCALATE** — goldseel unreachable → defer to a human (never auto-approved)
+
+```python
+from korgchat import ChatSession
+from korgchat.gate import goldseel_pay_tool, payment_mandate
+from korgchat.tools import default_tools
+
+tools = default_tools()
+tools.register(goldseel_pay_tool(payment_mandate(
+    "Pay only for AI inference / GPU compute. No gambling, adult, or crypto-trading.",
+    spend_cap_usd=50,
+)))
+session = ChatSession(journal_path=..., responder=..., tools=tools)
+```
+
+The decision, the goldseel verdict, and the mandate hash are recorded to the
+ledger — so *what an agent was allowed to spend, and why,* is provable. The
+gate is model-agnostic: point `GOLDSEEL_URL` at any goldseel deployment.
+
+### Knowledge floor (ontology) — and how it compounds
+
+Before goldseel is consulted, the `pay` tool resolves the recipient against a
+**category ontology** (`korgchat.ontology`): a controlled vocabulary with
+synonyms and an is-a hierarchy (`ml-inference` ≡ `ai-inference` ≡
+`llm-inference`, all *is-a* `ai-compute`; `gambling`/`adult`/`crypto-trading`
+*is-a* `prohibited`) plus a vendor registry. **Known recipients resolve
+deterministically** — ALLOW/DENY with no model call — so `ml-inference ≠
+ai-inference` mistakes are impossible, and the model is only spent on genuine
+unknowns.
+
+It **compounds**: every newly-classified recipient is learned back into the
+registry (`learn()`, optionally persisted), so the known set grows
+monotonically — the more decisions the system makes, the fewer reach the model
+and the more consistent it gets (a data network effect). Each `pay` result
+records `decided_by` (`ontology` vs `goldseel`) so the audit shows *which*
+layer decided.
+
+```python
+from korgchat.gate import payment_mandate, goldseel_pay_tool
+tool = goldseel_pay_tool(payment_mandate(
+    "Pay only for AI inference / GPU compute. No gambling.",
+    spend_cap_usd=50, allow_classes=["ai-compute"], deny_classes=["prohibited"],
+))
 ```
 
 ## Streaming (v0.4.2)

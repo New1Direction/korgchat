@@ -13,6 +13,7 @@ from pathlib import Path
 from korgchat import __version__
 from korgchat.chat import ChatSession, MockResponder, ToolCall, select_responder
 from korgchat.recall import RecallEngine, format_matches
+from korgchat.sandbox import SandboxClient, SandboxError, shell_mandate, tools_with_sandbox
 from korgchat.summary import SummarizeEngine
 
 
@@ -69,6 +70,22 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.005,
         help="(--mock only) Delay between simulated tokens, seconds. Default "
              "0.005 gives a visible streaming effect; set to 0 for instant output.",
+    )
+    p.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="Add a sandboxed `bash` tool backed by just-bash (in-memory "
+             "filesystem, no host or network access). Requires Node and "
+             "`npm install` in sandbox/. Every command and the resulting "
+             "filesystem hash are recorded to the ledger for verifiable replay.",
+    )
+    p.add_argument(
+        "--mandate-allow",
+        metavar="CMDS",
+        help="Comma-separated allowlist of shell commands the sandbox may run "
+             "(e.g. 'ls,cat,grep,sed,awk,find'). Enables --sandbox. Commands "
+             "outside the list are blocked and the verdict is recorded to the "
+             "ledger; the allowlist is enforced physically and as a pre-exec check.",
     )
     return p
 
@@ -512,13 +529,32 @@ def main(argv: list[str] | None = None) -> int:
     if args.mock and streaming and args.stream_delay > 0:
         responder = MockResponder(stream_delay_secs=args.stream_delay)
 
-    session = ChatSession(
+    sandbox_client: SandboxClient | None = None
+    session_kwargs: dict = dict(
         journal_path=Path(args.journal),
         responder=responder,
         auto_context=args.auto_context,
     )
+    mandate = None
+    if args.mandate_allow:
+        allow = [c.strip() for c in args.mandate_allow.split(",") if c.strip()]
+        mandate = shell_mandate(allow)
+    if args.sandbox or mandate is not None:
+        try:
+            sandbox_client = SandboxClient(mandate=mandate)
+            sandbox_client.ping()
+        except SandboxError as e:
+            print(f"[korgchat] --sandbox unavailable: {e}", file=sys.stderr)
+            return 2
+        session_kwargs["tools"] = tools_with_sandbox(client=sandbox_client)
+
+    session = ChatSession(**session_kwargs)
     _print_banner(session, mock=args.mock, streaming=streaming)
-    return _interactive_loop(session, args.turns, streaming=streaming)
+    try:
+        return _interactive_loop(session, args.turns, streaming=streaming)
+    finally:
+        if sandbox_client is not None:
+            sandbox_client.close()
 
 
 if __name__ == "__main__":
